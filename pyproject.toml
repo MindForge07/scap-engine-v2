@@ -1,0 +1,44 @@
+[project]
+name = "scap-engine"
+version = "2.0.0"
+description = "SCAP — Project Memory System. Externalizes model knowledge into structured decision records for cross-session consistency."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    {name = "MindForge07", email = "your.email@example.com"}
+]
+keywords = ["AI", "memory", "knowledge-management", "MCP", "project-memory"]
+
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "click>=8.0",
+    "rich>=13.0",
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/MindForge07/scap-engine-v2"
+Repository = "https://github.com/MindForge07/scap-engine-v2"
+
+[project.scripts]
+scap = "scap.cli:cli"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["scap*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
