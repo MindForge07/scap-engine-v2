@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "scap": {
+      "command": "python",
+      "args": ["-m", "scap.mcp_server"],
+      "cwd": "C:\\Users\\XDXLC\\openclaw\\scap-engine-v2",
+      "env": {
+        "SCAP_EXPORT_DIR": "C:\\Users\\XDXLC\\openclaw\\scap-engine-v2\\.scap"
+      }
+    }
+  }
+}
