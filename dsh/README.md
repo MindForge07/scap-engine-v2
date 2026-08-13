@@ -16,7 +16,9 @@ SQLite + 自动导出 .scap/{project}.md + .scap/{project}.json（结构化投�
    ▼
 L0 项目卡片（常驻）：Tech Stack / Conventions / Insights
 L1 任务相关预检索（自动，零 LLM）：
-   读取最近 user message → 与 scap recall 同一套打分器
+   读取最近 user message（白名单：仅 `source.kind === 'user'`——DSH 的
+   MessageSource 是 merge-extensible，插件注入（instructions/时间/运行时
+   上下文）一律排除）→ 与 scap recall 同一套打分器
    （CJK bigram + 拉丁词 + IDF + recency 衰减 + importance 加成）
    → top-N 相关决策 + 常驻决策（importance≥4 或近 7 天）换入注入内容
    → 相关经验 top-2

@@ -253,15 +253,20 @@ function textOfEvent(event: SessionEventLike): string | undefined {
   return block?.type === 'text' && block.text ? block.text : undefined
 }
 
-/** 最近一条真实用户消息（排除 plugin 注入的 system-reminder 等），作为 L1 任务文本。 */
+/** 最近一条真实用户消息，作为 L1 任务文本。
+ *
+ * MessageSource is merge-extensible (plugins add kinds like
+ * 'agent-instructions'), so a blacklist can never keep up: we accept ONLY
+ * `kind: 'user'` — plugin injections (instructions, time context, runtime
+ * context) are excluded by construction.
+ */
 export function lastUserTask(agent: AssembleLike['agent']): string | undefined {
   const events = agent?.session?.events
   if (!events) return undefined
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event = events[i]
     if (event?.type !== 'user/message') continue
-    const kind = event.data?.source?.kind
-    if (kind === 'plugin') continue // agent-instructions / time-context 等注入
+    if (event.data?.source?.kind !== 'user') continue
     const text = textOfEvent(event)
     if (text && text.trim()) return text.trim()
   }
