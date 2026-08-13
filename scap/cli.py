@@ -392,6 +392,32 @@ def evolved(ctx: click.Context, project: str, task: str, min_fitness: float) -> 
 
 
 @cli.command()
+@click.argument("entity_id")
+@click.option("--helpful/--unhelpful", default=True,
+              help="Mark the memory as helpful (default) or unhelpful")
+@click.option("--project", "-p", default="", help="Project scope (validated when given)")
+@click.pass_context
+def feedback(ctx: click.Context, entity_id: str, helpful: bool, project: str) -> None:
+    """Rate whether a recalled memory was helpful (closed loop).
+
+    EMA-updates the latent trace fitness and nudges the owning record's
+    importance, so consolidation and ranking reflect real usage.
+    """
+    store: MemoryStore = ctx.obj["store"]
+    if project:
+        ent = store.get_decision(entity_id) or store.get_experience(entity_id)
+        if ent is not None and ent.project != project:
+            console.print(f"[red]{entity_id} 不属于项目 {project}[/red]")
+            return
+    trace = store.update_fitness(entity_id, helpful)
+    if trace is None:
+        console.print(f"[yellow]{entity_id} 没有 latent trace（写入时未生成 embedding），无法更新 fitness[/yellow]")
+        return
+    console.print(f"[green]✓[/green] {entity_id} fitness → {trace.fitness} "
+                  f"({'helpful' if helpful else 'unhelpful'})")
+
+
+@cli.command()
 @click.option("--project", "-p", default="", help="Filter by project")
 @click.option("--limit", "-l", default=50, help="Max results")
 @click.pass_context

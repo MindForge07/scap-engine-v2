@@ -131,9 +131,13 @@ class MemoryStore:
             ("decisions", "superseded_by", "TEXT"),
             ("decisions", "embedding", "TEXT"),
             ("decisions", "evolution_gen", "INTEGER DEFAULT 0"),
+            ("decisions", "importance", "INTEGER DEFAULT 3"),
+            ("decisions", "source_session", "TEXT DEFAULT ''"),
             ("experiences", "tags", "TEXT DEFAULT '[]'"),
             ("experiences", "embedding", "TEXT"),
             ("experiences", "evolution_gen", "INTEGER DEFAULT 0"),
+            ("experiences", "importance", "INTEGER DEFAULT 3"),
+            ("experiences", "source_session", "TEXT DEFAULT ''"),
         ]
         for table, col, col_type in _migrations:
             try:
@@ -179,8 +183,9 @@ class MemoryStore:
                 """INSERT OR REPLACE INTO decisions
                    (id, project, title, context, decision, rationale,
                     alternatives, constraints, status, superseded_by, tags,
-                    created_at, updated_at, embedding, evolution_gen)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    created_at, updated_at, embedding, evolution_gen,
+                    importance, source_session)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     d.id, d.project, d.title, d.context, d.decision, d.rationale,
                     json.dumps(d.alternatives, ensure_ascii=False),
@@ -190,6 +195,7 @@ class MemoryStore:
                     d.created_at.isoformat(), d.updated_at.isoformat(),
                     json.dumps(d.embedding) if d.embedding else None,
                     d.evolution_gen,
+                    d.importance, d.source_session,
                 ),
             )
             self._sync_fts(d.id, "decision", d.project,
@@ -206,7 +212,8 @@ class MemoryStore:
         return self._row_to_decision(row) if row else None
 
     def list_decisions(
-        self, project: str = "", status: str = "", limit: int = 50
+        self, project: str = "", status: str = "", limit: int = 50,
+        importance_first: bool = False,
     ) -> List[Decision]:
         clauses, params = [], []
         if project:
@@ -216,8 +223,9 @@ class MemoryStore:
             clauses.append("status = ?")
             params.append(status)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        order = "importance DESC, updated_at DESC" if importance_first else "updated_at DESC"
         rows = self.conn.execute(
-            f"SELECT * FROM decisions{where} ORDER BY updated_at DESC LIMIT ?",
+            f"SELECT * FROM decisions{where} ORDER BY {order} LIMIT ?",
             (*params, limit),
         ).fetchall()
         return [self._row_to_decision(r) for r in rows]
@@ -250,6 +258,8 @@ class MemoryStore:
             updated_at=datetime.fromisoformat(r["updated_at"]),
             embedding=json.loads(r["embedding"]) if r["embedding"] else None,
             evolution_gen=r["evolution_gen"] if "evolution_gen" in r.keys() else 0,
+            importance=r["importance"] if "importance" in r.keys() else 3,
+            source_session=r["source_session"] if "source_session" in r.keys() else "",
         )
 
     # ── ProjectContext CRUD ──
@@ -297,14 +307,15 @@ class MemoryStore:
             self.conn.execute(
                 """INSERT OR REPLACE INTO experiences
                    (id, project, situation, action, lesson, tags, created_at,
-                    embedding, evolution_gen)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                    embedding, evolution_gen, importance, source_session)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     e.id, e.project, e.situation, e.action, e.lesson,
                     json.dumps(e.tags, ensure_ascii=False),
                     e.created_at.isoformat(),
                     json.dumps(e.embedding) if e.embedding else None,
                     e.evolution_gen,
+                    e.importance, e.source_session,
                 ),
             )
             self._sync_fts(e.id, "experience", e.project,
@@ -489,6 +500,46 @@ class MemoryStore:
             )
             self.conn.commit()
             return cur.rowcount > 0
+
+    def update_fitness(self, entity_id: str, helpful: bool) -> Optional[LatentTrace]:
+        """Apply feedback to a memory record's latent trace (closed loop).
+
+        EMA-updates the trace's fitness toward 1.0 (helpful) or 0.0
+        (unhelpful) and nudges the owning Decision/Experience importance in
+        the same direction (bounded 1..5), so feedback flows into
+        consolidate / evolved_context and the injected ranking.
+
+        Returns the updated trace, or None when the entity has no latent
+        trace (no embedding was ever generated).
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM latent_traces WHERE entity_id = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (entity_id,),
+            ).fetchone()
+            if not row:
+                return None
+            trace = self._row_to_latent_trace(row)
+            target = 1.0 if helpful else 0.0
+            trace.fitness = round(0.8 * trace.fitness + 0.2 * target, 4)
+            self.conn.execute(
+                "UPDATE latent_traces SET fitness = ? WHERE id = ?",
+                (trace.fitness, trace.id),
+            )
+            delta = 1 if helpful else -1
+            if trace.entity_type == "decision":
+                self.conn.execute(
+                    "UPDATE decisions SET importance = MAX(1, MIN(5, importance + ?)) WHERE id = ?",
+                    (delta, entity_id),
+                )
+            elif trace.entity_type == "experience":
+                self.conn.execute(
+                    "UPDATE experiences SET importance = MAX(1, MIN(5, importance + ?)) WHERE id = ?",
+                    (delta, entity_id),
+                )
+            self.conn.commit()
+        return trace
 
     def list_latent_traces(self, project: str = "", entity_id: str = "",
                            limit: int = 50) -> List[LatentTrace]:
@@ -720,7 +771,9 @@ class MemoryStore:
                         break
                 add("")
 
-        decisions = self.list_decisions(project=project, status="active", limit=200)
+        decisions = self.list_decisions(
+            project=project, status="active", limit=200, importance_first=True,
+        )
         seen_pairs: set[tuple[str, str]] = set()
         if decisions:
             add("## Decisions")
@@ -791,4 +844,6 @@ class MemoryStore:
             created_at=datetime.fromisoformat(r["created_at"]),
             embedding=json.loads(r["embedding"]) if r["embedding"] else None,
             evolution_gen=r["evolution_gen"] if "evolution_gen" in r.keys() else 0,
+            importance=r["importance"] if "importance" in r.keys() else 3,
+            source_session=r["source_session"] if "source_session" in r.keys() else "",
         )

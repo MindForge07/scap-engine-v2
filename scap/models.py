@@ -39,6 +39,14 @@ class Decision(BaseModel):
     status: Literal["active", "superseded", "deprecated"] = "active"
     superseded_by: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
+    # ── Memory quality (P0) ──
+    importance: int = Field(
+        default=3, ge=1, le=5,
+        description="1-5 importance of this decision (5 = critical project fact)",
+    )
+    source_session: str = Field(
+        default="", description="Session id that produced this record, when known",
+    )
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     # ── Latent space evolution fields (Phase 1) ──
@@ -86,6 +94,14 @@ class Experience(BaseModel):
     action: str = Field(default="", description="What was done")
     lesson: str = Field(default="", description="What to do differently")
     tags: List[str] = Field(default_factory=list)
+    # ── Memory quality (P0) ──
+    importance: int = Field(
+        default=3, ge=1, le=5,
+        description="1-5 importance of this lesson (5 = critical project fact)",
+    )
+    source_session: str = Field(
+        default="", description="Session id that produced this record, when known",
+    )
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     # ── Latent space evolution fields (Phase 1) ──
     embedding: Optional[List[float]] = Field(

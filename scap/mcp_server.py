@@ -1,4 +1,4 @@
-"""SCAP v2 — MCP server. 8 tools, designed for AI self-recording + latent evolution.
+"""SCAP v2 — MCP server. 9 tools, designed for AI self-recording + latent evolution.
 
 Tools 1-5 (core memory):
   scap_recall, scap_remember, scap_record_experience, scap_context, scap_status
@@ -7,6 +7,9 @@ Tools 6-8 (latent space evolution — require sentence-transformers):
   scap_retrieve_latent  — semantic similarity search via embeddings
   scap_consolidate      — nighttime consolidation: merge similar traces, advance gen
   scap_evolved_context   — fitness-weighted context retrieval with evolution metadata
+
+Tool 9 (memory quality closed loop):
+  scap_feedback         — rate a recalled memory; EMA-updates fitness + importance
 """
 from __future__ import annotations
 
@@ -153,10 +156,17 @@ def _term_idf(terms: list[str], corpus_texts: list[str]) -> dict[str, float]:
     return {t: math.log(1 + n / (1 + df.get(t, 0))) for t in terms}
 
 
+# Recency decay: a decision's relevance fades with age (~45-day characteristic
+# decay: 0.51 weight at 30 days, 0.14 at 90 days). Fights stale-memory anchoring
+# while keeping old but strongly-matching decisions recallable.
+_RECENCY_DECAY_DAYS = 45.0
+
+
 def _decision_relevance(task: str, decision_text: str,
                         query_vector: Optional[List[float]],
                         embedding: Optional[List[float]],
-                        idf: Optional[dict[str, float]] = None) -> float:
+                        idf: Optional[dict[str, float]] = None,
+                        age_days: float = 0.0) -> float:
     """Relevance of one decision against a task, 0..1.
 
     The relevance floor is judged on the PLAIN hit ratio — fewer than ~1/7 of
@@ -164,7 +174,9 @@ def _decision_relevance(task: str, decision_text: str,
     itself is idf-weighted when a corpus idf map is supplied, so common terms
     ("系统", "选择") contribute little to ranking. When both a query vector and
     a decision embedding are present the vectors dominate the blend; otherwise
-    the lexical term is the whole score.
+    the lexical term is the whole score. The blended score is then decayed by
+    the record's age (recency weighting), so freshly-written decisions rank
+    above stale ones.
     """
     terms = _task_match_terms(task)
     lexical = 0.0
@@ -180,8 +192,10 @@ def _decision_relevance(task: str, decision_text: str,
                 lexical = matched_count / len(terms)
     if query_vector is not None and embedding:
         vec_sim = MemoryStore._cosine_similarity(query_vector, embedding)
-        return 0.6 * max(vec_sim, 0.0) + 0.4 * lexical
-    return lexical
+        base = 0.6 * max(vec_sim, 0.0) + 0.4 * lexical
+    else:
+        base = lexical
+    return base * math.exp(-max(age_days, 0.0) / _RECENCY_DECAY_DAYS)
 
 
 def _format_recall(store: MemoryStore, project: str, task: str,
@@ -217,10 +231,17 @@ def _format_recall(store: MemoryStore, project: str, task: str,
         for d in all_decisions
     ]
     idf = _term_idf(_task_match_terms(task), corpus_texts)
+    now = datetime.now(timezone.utc)
     scored = []
     for d in all_decisions:
         d_text = f"{d.title} {d.decision} {d.rationale} {' '.join(d.constraints)}"
-        score = _decision_relevance(task, d_text, query_vector, d.embedding, idf=idf)
+        created = d.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_days = (now - created).total_seconds() / 86400.0
+        score = _decision_relevance(
+            task, d_text, query_vector, d.embedding, idf=idf, age_days=age_days,
+        )
         if score > 0:
             scored.append((score, d))
     scored.sort(key=lambda x: -x[0])
@@ -334,25 +355,43 @@ async def scap_remember(
     title: str,
     decision: str,
     rationale: str = "",
+    importance: int = 3,
+    source_session: str = "",
 ) -> str:
     """Record a project decision. Call this after making a significant choice.
 
-    Keep it concise — just the key facts. You don't need to fill every field.
+    Keep it concise — just the key facts. A decision recorded without a
+    rationale is treated as low-importance (capped at 2): future sessions
+    should not be anchored to unexplained choices.
 
     Args:
         project: Project name
         title: Short title, e.g. "消息队列选型"
-        decision: What was chosen, e.g. "Kafka"
+        decision: What was chosen, e.g. "Kafka" (required)
         rationale: Why, e.g. "吞吐量需求 50k msg/s, RabbitMQ 在 10k+ 时性能下降"
+        importance: 1-5 importance (default 3; 5 = critical project fact)
+        source_session: Session id that produced this decision, when known
     """
     store = _get_store()
     _ensure_project(store, project)
     try:
+        decision = decision.strip()
+        if not decision:
+            return json.dumps({
+                "success": False,
+                "error": "decision 不能为空：请填写实际选择（如 Kafka）",
+            }, ensure_ascii=False)
+        rationale = rationale.strip()
+        if not rationale and importance > 2:
+            importance = 2  # quality gate: unexplained choices stay low-importance
+        importance = min(max(int(importance), 1), 5)
         d = Decision(
             project=project,
-            title=title,
+            title=title.strip() or "未命名决策",
             decision=decision,
             rationale=rationale,
+            importance=importance,
+            source_session=source_session,
         )
         # Generate embedding before save (stored in decisions.embedding column)
         d.embedding = _try_embed(f"{title} {decision} {rationale}")
@@ -360,11 +399,15 @@ async def scap_remember(
         # Save latent trace for vector search
         _save_trace(store, d)
         _auto_export(store, project)
+        message = f"Recorded: {d.id} — {d.title}"
+        if not rationale:
+            message += "（无 rationale，importance 已降为 2）"
         return json.dumps({
             "success": True,
             "decision_id": d.id,
             "embedded": d.embedding is not None,
-            "message": f"Recorded: {d.id} — {d.title}",
+            "importance": d.importance,
+            "message": message,
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
@@ -377,6 +420,8 @@ async def scap_record_experience(
     action: str,
     lesson: str,
     tags: str = "",
+    importance: int = 3,
+    source_session: str = "",
 ) -> str:
     """Record a lesson learned from experience. Call when you discover
     a pattern worth remembering — e.g. a bug root cause, a performance
@@ -386,12 +431,22 @@ async def scap_record_experience(
         project: Project name
         situation: What happened (e.g. "上线后 CPU 飙到 90%")
         action: What was done (e.g. "加了 ReadOnly 注解 + fetch join")
-        lesson: What to remember (e.g. "JPA 查询必须加 @EntityGraph 防 N+1")
+        lesson: What to remember (e.g. "JPA 查询必须加 @EntityGraph 防 N+1") (required)
         tags: Optional comma-separated tags (e.g. "性能,JPA,N+1")
+        importance: 1-5 importance (default 3; 5 = critical project fact)
+        source_session: Session id that produced this lesson, when known
     """
     store = _get_store()
     _ensure_project(store, project)
     try:
+        lesson = lesson.strip()
+        if not lesson:
+            return json.dumps({
+                "success": False,
+                "error": "lesson 不能为空：请填写要记住的教训（如 JPA 查询必须加 fetch join）",
+            }, ensure_ascii=False)
+        situation = situation.strip()
+        importance = min(max(int(importance), 1), 5)
         tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
         e = Experience(
             project=project,
@@ -399,6 +454,8 @@ async def scap_record_experience(
             action=action,
             lesson=lesson,
             tags=tag_list,
+            importance=importance,
+            source_session=source_session,
         )
         # Generate embedding before save (stored in experiences.embedding column)
         e.embedding = _try_embed(f"{situation} {action} {lesson}")
@@ -410,6 +467,7 @@ async def scap_record_experience(
             "success": True,
             "experience_id": e.id,
             "embedded": e.embedding is not None,
+            "importance": e.importance,
             "message": f"Recorded: {e.id} — {lesson[:50]}",
         }, ensure_ascii=False)
     except Exception as e:
@@ -671,6 +729,46 @@ async def scap_evolved_context(
         "returned": len(results),
         "results": results,
     }, ensure_ascii=False)
+
+
+@mcp.tool()
+async def scap_feedback(entity_id: str, helpful: bool, project: str = "") -> str:
+    """Rate whether a recalled memory was actually helpful (closed loop).
+
+    Updates the latent trace's fitness (EMA toward 1.0 / 0.0) and nudges the
+    owning record's importance, so consolidate / evolved_context and the
+    injected ranking reflect real usage. Call this after scap_recall or
+    scap_retrieve_latent results were used (or found useless / misleading).
+
+    Args:
+        entity_id: Decision or Experience id (e.g. DC-20260814-0001)
+        helpful: True when the memory helped; False when it misled or was noise
+        project: Optional project scope (validated when given)
+    """
+    store = _get_store()
+    try:
+        if project:
+            ent = store.get_decision(entity_id) or store.get_experience(entity_id)
+            if ent is not None and ent.project != project:
+                return json.dumps({
+                    "success": False,
+                    "error": f"entity {entity_id} 不属于项目 {project}",
+                }, ensure_ascii=False)
+        trace = store.update_fitness(entity_id, helpful)
+        if trace is None:
+            return json.dumps({
+                "success": False,
+                "error": f"{entity_id} 没有 latent trace（写入时未生成 embedding），无法更新 fitness",
+            }, ensure_ascii=False)
+        return json.dumps({
+            "success": True,
+            "entity_id": entity_id,
+            "helpful": helpful,
+            "fitness": trace.fitness,
+            "message": f"Feedback recorded: {entity_id} fitness → {trace.fitness}",
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
 
 
 # ── Entry point ──
