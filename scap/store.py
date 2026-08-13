@@ -80,6 +80,7 @@ class MemoryStore:
                 tech_stack TEXT DEFAULT '[]',
                 conventions TEXT DEFAULT '[]',
                 active_goals TEXT DEFAULT '[]',
+                insights TEXT DEFAULT '[]',
                 updated_at TEXT NOT NULL
             );
 
@@ -138,6 +139,7 @@ class MemoryStore:
             ("experiences", "evolution_gen", "INTEGER DEFAULT 0"),
             ("experiences", "importance", "INTEGER DEFAULT 3"),
             ("experiences", "source_session", "TEXT DEFAULT ''"),
+            ("project_contexts", "insights", "TEXT DEFAULT '[]'"),
         ]
         for table, col, col_type in _migrations:
             try:
@@ -177,7 +179,10 @@ class MemoryStore:
                 d.id = self._next_id("DC", "decisions")
             if not d.created_at:
                 d.created_at = datetime.now(timezone.utc)
-            d.updated_at = datetime.now(timezone.utc)
+            if not d.updated_at:
+                d.updated_at = datetime.now(timezone.utc)
+            # Explicit timestamps are respected (history import / replay), so a
+            # record can stay "last updated" at its real time.
 
             self.conn.execute(
                 """INSERT OR REPLACE INTO decisions
@@ -269,13 +274,14 @@ class MemoryStore:
         with self._lock:
             self.conn.execute(
                 """INSERT OR REPLACE INTO project_contexts
-                   (project, tech_stack, conventions, active_goals, updated_at)
-                   VALUES (?,?,?,?,?)""",
+                   (project, tech_stack, conventions, active_goals, insights, updated_at)
+                   VALUES (?,?,?,?,?,?)""",
                 (
                     ctx.project,
                     json.dumps(ctx.tech_stack, ensure_ascii=False),
                     json.dumps(ctx.conventions, ensure_ascii=False),
                     json.dumps(ctx.active_goals, ensure_ascii=False),
+                    json.dumps(ctx.insights, ensure_ascii=False),
                     ctx.updated_at.isoformat(),
                 ),
             )
@@ -292,6 +298,7 @@ class MemoryStore:
             tech_stack=json.loads(row["tech_stack"]),
             conventions=json.loads(row["conventions"]),
             active_goals=json.loads(row["active_goals"]),
+            insights=json.loads(row["insights"]) if "insights" in row.keys() else [],
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
 
@@ -768,6 +775,12 @@ class MemoryStore:
                 add("## Active Goals")
                 for g in ctx.active_goals:
                     if not add(f"- {g}"):
+                        break
+                add("")
+            if ctx.insights:
+                add("## Insights")
+                for i in ctx.insights:
+                    if not add(f"- {i}"):
                         break
                 add("")
 

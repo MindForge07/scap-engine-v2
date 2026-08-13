@@ -392,6 +392,47 @@ def evolved(ctx: click.Context, project: str, task: str, min_fitness: float) -> 
 
 
 @cli.command()
+@click.option("--project", "-p", required=True, help="Project to audit")
+@click.option("--older-than", "-o", default=90, type=int, help="Days since last update (default 90)")
+@click.option("--limit", "-l", default=20, type=int, help="Max results")
+@click.pass_context
+def audit(ctx: click.Context, project: str, older_than: int, limit: int) -> None:
+    """List active decisions that have not been touched for a while (stale check).
+
+    Review the listed decisions and supersede outdated ones (scap remember
+    with the same title auto-supersedes the old record).
+    """
+    store: MemoryStore = ctx.obj["store"]
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(older_than, 1))
+    decisions = store.list_decisions(project=project, status="active", limit=500)
+    now = datetime.now(timezone.utc)
+    stale = []
+    for d in decisions:
+        updated = d.updated_at
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if updated < cutoff:
+            stale.append((d, int((now - updated).total_seconds() // 86400)))
+    stale.sort(key=lambda x: -x[0].importance)
+    stale = stale[:limit]
+    if not stale:
+        console.print(f"[green]✓[/green] 项目 '{project}' 的 active 决策均未超过 {older_than} 天未更新")
+        return
+    table = Table(title=f"Stale Active Decisions — {project} (> {older_than}d)")
+    table.add_column("ID", style="cyan")
+    table.add_column("Title")
+    table.add_column("Importance", style="green")
+    table.add_column("Updated", style="yellow")
+    table.add_column("Days")
+    for d, days in stale:
+        table.add_row(d.id, d.title[:40], str(d.importance),
+                      d.updated_at.strftime("%Y-%m-%d"), str(days))
+    console.print(table)
+    console.print(f"[dim]共 {len(stale)} 条待复核。过时的用 `scap remember` 同标题记录新决策（自动 supersede）。[/dim]")
+
+
+@cli.command()
 @click.argument("entity_id")
 @click.option("--helpful/--unhelpful", default=True,
               help="Mark the memory as helpful (default) or unhelpful")

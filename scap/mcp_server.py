@@ -1,4 +1,4 @@
-"""SCAP v2 — MCP server. 9 tools, designed for AI self-recording + latent evolution.
+"""SCAP v2 — MCP server. 11 tools, designed for AI self-recording + latent evolution.
 
 Tools 1-5 (core memory):
   scap_recall, scap_remember, scap_record_experience, scap_context, scap_status
@@ -8,8 +8,10 @@ Tools 6-8 (latent space evolution — require sentence-transformers):
   scap_consolidate      — nighttime consolidation: merge similar traces, advance gen
   scap_evolved_context   — fitness-weighted context retrieval with evolution metadata
 
-Tool 9 (memory quality closed loop):
+Tools 9-11 (memory quality & lifecycle):
   scap_feedback         — rate a recalled memory; EMA-updates fitness + importance
+  scap_audit            — find stale active decisions for review
+  scap_reflect          — distill high-level project insights into the context
 """
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ import logging
 import math
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -318,6 +320,13 @@ The context.md file updates automatically.
 Call scap_record_experience to capture it.
 The context.md file updates automatically.
 
+### AFTER a long task or session:
+Call scap_reflect to distill 1-5 high-level project insights (patterns,
+conventions, architectural lessons). They are injected into future sessions.
+
+### Periodically:
+Call scap_audit to find stale active decisions; supersede outdated ones.
+
 ### WHAT TO RECORD (judge by: will this affect future decisions?):
   ✓ Tech choices ("we chose Kafka over RabbitMQ because...")
   ✓ Architecture decisions ("using event sourcing for orders")
@@ -385,6 +394,25 @@ async def scap_remember(
         if not rationale and importance > 2:
             importance = 2  # quality gate: unexplained choices stay low-importance
         importance = min(max(int(importance), 1), 5)
+
+        # ── Four-operation write (mem0-style, rule-based, zero-LLM) ──
+        # NOOP: an identical active decision already exists → do not duplicate.
+        # UPDATE: a same-titled active decision exists with a different choice
+        #         → supersede it automatically (title = the decision topic).
+        prev: Optional[Decision] = None
+        for existing in store.list_decisions(project=project, status="active", limit=200):
+            if existing.title.strip() == title.strip():
+                prev = existing
+                break
+        if prev is not None and prev.decision.strip() == decision:
+            return json.dumps({
+                "success": True,
+                "action": "noop",
+                "decision_id": prev.id,
+                "importance": prev.importance,
+                "message": f"相同决策已存在: {prev.id} — {prev.title}（未重复记录）",
+            }, ensure_ascii=False)
+
         d = Decision(
             project=project,
             title=title.strip() or "未命名决策",
@@ -395,16 +423,25 @@ async def scap_remember(
         )
         # Generate embedding before save (stored in decisions.embedding column)
         d.embedding = _try_embed(f"{title} {decision} {rationale}")
-        d = store.save_decision(d)
+        if prev is not None:
+            d = store.supersede(prev.id, d)
+            action = "update"
+        else:
+            d = store.save_decision(d)
+            action = "add"
         # Save latent trace for vector search
         _save_trace(store, d)
         _auto_export(store, project)
         message = f"Recorded: {d.id} — {d.title}"
+        if action == "update":
+            message = f"已更新决策（supersede {prev.id}）: {d.id} — {d.title}"
         if not rationale:
             message += "（无 rationale，importance 已降为 2）"
         return json.dumps({
             "success": True,
+            "action": action,
             "decision_id": d.id,
+            "superseded": prev.id if prev is not None else None,
             "embedded": d.embedding is not None,
             "importance": d.importance,
             "message": message,
@@ -769,6 +806,104 @@ async def scap_feedback(entity_id: str, helpful: bool, project: str = "") -> str
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+async def scap_audit(project: str, older_than_days: int = 90, limit: int = 20) -> str:
+    """List active decisions that have not been touched for a while (stale check).
+
+    Stale active decisions may no longer reflect reality. Review the listed
+    items and either record a replacement (scap_remember auto-supersedes a
+    same-titled decision) or leave them. Run periodically (e.g. weekly).
+
+    Args:
+        project: Project name
+        older_than_days: Review decisions untouched for at least this many days (default 90)
+        limit: Max results (default 20, max 100)
+    """
+    store = _get_store()
+    limit = min(max(int(limit), 1), 100)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(int(older_than_days), 1))
+    decisions = store.list_decisions(project=project, status="active", limit=500)
+    now = datetime.now(timezone.utc)
+    stale = []
+    for d in decisions:
+        updated = d.updated_at
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        if updated < cutoff:
+            stale.append({
+                "id": d.id,
+                "title": d.title,
+                "decision": d.decision,
+                "importance": d.importance,
+                "updated_at": d.updated_at.strftime("%Y-%m-%d"),
+                "days_since_update": int((now - updated).total_seconds() // 86400),
+            })
+    stale.sort(key=lambda x: -x["importance"])
+    stale = stale[:limit]
+    return json.dumps({
+        "success": True,
+        "project": project,
+        "stale_count": len(stale),
+        "total_active": len(decisions),
+        "stale": stale,
+        "message": (
+            f"{len(stale)}/{len(decisions)} 条 active 决策超过 {older_than_days} 天未更新。"
+            f"请复核：过时的调用 scap_remember 记录新决策（同标题会自动 supersede 旧决策）。"
+        ),
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+async def scap_reflect(project: str, insights: List[str]) -> str:
+    """Record high-level project insights distilled from recent work.
+
+    Call this at the end of a long task or session: summarize 1-5 concise,
+    high-level takeaways (patterns, conventions, architectural lessons) that
+    future sessions should know. Insights are stored on the project context
+    and injected with the next context.md export — they become durable
+    project knowledge without polluting the decision records.
+
+    Args:
+        project: Project name
+        insights: 1-5 concise high-level takeaways (e.g. "事件溯源是我们状态变更的默认模式")
+    """
+    store = _get_store()
+    _ensure_project(store, project)
+    cleaned = [i.strip() for i in insights if i and i.strip()]
+    if not cleaned:
+        return json.dumps({
+            "success": False,
+            "error": "insights 不能为空：请提供 1-5 条高层洞察",
+        }, ensure_ascii=False)
+    cleaned = cleaned[:5]
+    ctx = store.get_project_context(project)
+    existing = list(ctx.insights) if ctx else []
+    seen = set(existing)
+    added = [i for i in cleaned if i not in seen]
+    if not added:
+        return json.dumps({
+            "success": True,
+            "added": 0,
+            "total_insights": len(existing),
+            "message": "洞察已存在，未重复添加",
+        }, ensure_ascii=False)
+    merged = (existing + added)[-20:]  # keep the most recent 20 insights
+    base = ProjectContext(project=project)
+    base.insights = merged
+    if ctx:
+        base.tech_stack = ctx.tech_stack
+        base.conventions = ctx.conventions
+        base.active_goals = ctx.active_goals
+    store.update_project_context(base)
+    _auto_export(store, project)
+    return json.dumps({
+        "success": True,
+        "added": len(added),
+        "total_insights": len(merged),
+        "message": f"已记录 {len(added)} 条洞察（共 {len(merged)} 条）",
+    }, ensure_ascii=False)
 
 
 # ── Entry point ──

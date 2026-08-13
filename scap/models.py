@@ -72,12 +72,17 @@ class Decision(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ProjectContext(BaseModel):
-    """Project-level state — tech stack, conventions, active goals."""
+    """Project-level state — tech stack, conventions, active goals, insights."""
 
     project: str = Field(..., min_length=1)
     tech_stack: List[str] = Field(default_factory=list)
     conventions: List[str] = Field(default_factory=list)
     active_goals: List[str] = Field(default_factory=list)
+    # ── Reflection insights (P1): high-level takeaways distilled from decisions.
+    insights: List[str] = Field(
+        default_factory=list,
+        description="High-level project insights distilled by scap_reflect",
+    )
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
