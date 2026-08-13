@@ -1,9 +1,10 @@
 """SCAP v2 — Core data models.
 
-Three entities:
+Four entities:
   Decision  — structured decision record (what, why, alternatives)
   ProjectContext — project-level state (stack, conventions, goals)
   Experience — post-hoc lesson (situation → action → lesson)
+  LatentTrace — latent space vector + evolution metadata for a memory record
 """
 from __future__ import annotations
 
@@ -40,6 +41,13 @@ class Decision(BaseModel):
     tags: List[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # ── Latent space evolution fields (Phase 1) ──
+    embedding: Optional[List[float]] = Field(
+        default=None, description="Latent vector representation (384-dim by default)"
+    )
+    evolution_gen: int = Field(
+        default=0, description="Evolution generation this record belongs to"
+    )
 
     @field_validator("id")
     @classmethod
@@ -79,6 +87,13 @@ class Experience(BaseModel):
     lesson: str = Field(default="", description="What to do differently")
     tags: List[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # ── Latent space evolution fields (Phase 1) ──
+    embedding: Optional[List[float]] = Field(
+        default=None, description="Latent vector representation (384-dim by default)"
+    )
+    evolution_gen: int = Field(
+        default=0, description="Evolution generation this record belongs to"
+    )
 
     @field_validator("id")
     @classmethod
@@ -87,4 +102,48 @@ class Experience(BaseModel):
             return v
         if not re.match(r"^EX-\d{8}-\d{4,}$", v):
             raise ValueError(f"Experience ID must match EX-YYYYMMDD-NNNN+, got: {v}")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# LatentTrace (Phase 1 — Latent Space Evolution)
+# ---------------------------------------------------------------------------
+
+class LatentTrace(BaseModel):
+    """A latent space trace — embedding + evolution metadata for a memory record.
+
+    Stores the vector representation of a Decision or Experience, along with
+    fitness score and evolution generation. Used by the vector similarity
+    search tier and the nighttime consolidation pipeline.
+    """
+
+    id: str = Field(default="", description="LT-YYYYMMDD-NNNN")
+    entity_id: str = Field(..., description="Reference to Decision or Experience ID")
+    entity_type: Literal["decision", "experience"] = Field(
+        ..., description="Which entity type this trace belongs to"
+    )
+    project: str = Field(..., min_length=1, description="Project namespace")
+    embedding: List[float] = Field(
+        ..., description="Latent vector (384-dim by default)"
+    )
+    fitness: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="Quality score from agent feedback (0=worst, 1=best)"
+    )
+    evolution_gen: int = Field(
+        default=0, description="Evolution generation when this trace was created"
+    )
+    source_tasks: List[str] = Field(
+        default_factory=list,
+        description="Task IDs that contributed to this trace"
+    )
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        if not v:
+            return v  # auto-generated later by store
+        if not re.match(r"^LT-\d{8}-\d{4,}$", v):
+            raise ValueError(f"LatentTrace ID must match LT-YYYYMMDD-NNNN+, got: {v}")
         return v

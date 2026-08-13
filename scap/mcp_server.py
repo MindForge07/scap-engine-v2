@@ -1,19 +1,31 @@
-"""SCAP v2 — MCP server. 5 tools, designed for AI self-recording."""
+"""SCAP v2 — MCP server. 8 tools, designed for AI self-recording + latent evolution.
+
+Tools 1-5 (core memory):
+  scap_recall, scap_remember, scap_record_experience, scap_context, scap_status
+
+Tools 6-8 (latent space evolution — require sentence-transformers):
+  scap_retrieve_latent  — semantic similarity search via embeddings
+  scap_consolidate      — nighttime consolidation: merge similar traces, advance gen
+  scap_evolved_context   — fitness-weighted context retrieval with evolution metadata
+"""
 from __future__ import annotations
 
 import json
 import logging
 import os
 from datetime import datetime, timezone
+from typing import List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from scap.models import Decision, ProjectContext, Experience
+from scap.models import Decision, ProjectContext, Experience, LatentTrace
 from scap.store import MemoryStore
+from scap.embedder import Embedder
 
 logger = logging.getLogger(__name__)
 
 _store: MemoryStore | None = None
+_embedder: Embedder | None = None
 # Default export path — per-project .scap/context.md
 _EXPORT_DIR = os.environ.get("SCAP_EXPORT_DIR", ".scap")
 
@@ -24,6 +36,15 @@ def _get_store() -> MemoryStore:
         _store = MemoryStore()
         _store.initialize()
     return _store
+
+
+def _get_embedder() -> Embedder:
+    """Lazy-init embedder singleton. Safe to call even if sentence-transformers
+    is not installed — is_available will return False."""
+    global _embedder
+    if _embedder is None:
+        _embedder = Embedder()
+    return _embedder
 
 
 def _ensure_project(store: MemoryStore, project: str) -> None:
@@ -41,8 +62,49 @@ def _auto_export(store: MemoryStore, project: str) -> None:
         logger.debug(f"Context export skipped: {e}")
 
 
-def _format_recall(store: MemoryStore, project: str, task: str) -> str:
-    """Format project memory as injection-ready text for LLM system prompt."""
+def _try_embed(text: str) -> Optional[List[float]]:
+    """Try to generate an embedding for the given text.
+
+    Returns the embedding vector, or None if the embedder is unavailable
+    or the text is empty. Never raises.
+    """
+    embedder = _get_embedder()
+    if not embedder.is_available:
+        return None
+    if not text or not text.strip():
+        return None
+    try:
+        return embedder.embed(text)
+    except Exception as e:
+        logger.warning(f"Embedding generation failed: {e}")
+        return None
+
+
+def _save_trace(store: MemoryStore, entity) -> None:
+    """Save a LatentTrace for an entity that has an embedding.
+
+    Silently skips if the entity has no embedding.
+    """
+    if not entity.embedding:
+        return
+    entity_type = "decision" if isinstance(entity, Decision) else "experience"
+    trace = LatentTrace(
+        entity_id=entity.id,
+        entity_type=entity_type,
+        project=entity.project,
+        embedding=entity.embedding,
+    )
+    store.save_latent_trace(trace)
+    logger.debug(f"LatentTrace saved for {entity_type} {entity.id}")
+
+
+def _format_recall(store: MemoryStore, project: str, task: str,
+                   query_vector: Optional[List[float]] = None) -> str:
+    """Format project memory as injection-ready text for LLM system prompt.
+
+    When query_vector is provided, uses four-tier search (FTS5 → vector → LIKE)
+    for experience retrieval, enabling semantic matching beyond keywords.
+    """
     lines = []
 
     # 1. Project context
@@ -87,8 +149,8 @@ def _format_recall(store: MemoryStore, project: str, task: str) -> str:
             if d.constraints:
                 lines.append(f"   - 约束: {', '.join(d.constraints)}")
 
-    # 3. Relevant experiences
-    exp_results = store.search(project, task, limit=3)
+    # 3. Relevant experiences — vector search when available
+    exp_results = store.search(project, task, limit=3, query_vector=query_vector)
     exp_hits = [h for h in exp_results if h.get("entity_type") == "experience"]
     if exp_hits:
         lines.append("\n## 相关经验教训")
@@ -155,7 +217,9 @@ async def scap_recall(project: str, task_description: str) -> str:
         task_description: What you're about to work on (1-2 sentences)
     """
     store = _get_store()
-    result = _format_recall(store, project, task_description)
+    # Generate query embedding for semantic search (gracefully degrades to None)
+    query_vector = _try_embed(task_description)
+    result = _format_recall(store, project, task_description, query_vector=query_vector)
     return json.dumps({"success": True, "context": result}, ensure_ascii=False)
 
 
@@ -185,11 +249,16 @@ async def scap_remember(
             decision=decision,
             rationale=rationale,
         )
+        # Generate embedding before save (stored in decisions.embedding column)
+        d.embedding = _try_embed(f"{title} {decision} {rationale}")
         d = store.save_decision(d)
+        # Save latent trace for vector search
+        _save_trace(store, d)
         _auto_export(store, project)
         return json.dumps({
             "success": True,
             "decision_id": d.id,
+            "embedded": d.embedding is not None,
             "message": f"Recorded: {d.id} — {d.title}",
         }, ensure_ascii=False)
     except Exception as e:
@@ -226,11 +295,16 @@ async def scap_record_experience(
             lesson=lesson,
             tags=tag_list,
         )
+        # Generate embedding before save (stored in experiences.embedding column)
+        e.embedding = _try_embed(f"{situation} {action} {lesson}")
         e = store.save_experience(e)
+        # Save latent trace for vector search
+        _save_trace(store, e)
         _auto_export(store, project)
         return json.dumps({
             "success": True,
             "experience_id": e.id,
+            "embedded": e.embedding is not None,
             "message": f"Recorded: {e.id} — {lesson[:50]}",
         }, ensure_ascii=False)
     except Exception as e:
@@ -286,6 +360,211 @@ async def scap_status() -> str:
         "total_decisions": stats["decision_count"],
         "total_experiences": stats["experience_count"],
         "projects": stats["projects"],
+        "latent_trace_count": stats.get("latent_trace_count", 0),
+        "evolution_gen": stats.get("evolution_gen", 0),
+    }, ensure_ascii=False)
+
+
+# ═══════════════════════════════════════════════════════
+# Latent Space Evolution Tools (Phase 2)
+# ═══════════════════════════════════════════════════════
+
+
+@mcp.tool()
+async def scap_retrieve_latent(
+    project: str,
+    query: str,
+    limit: int = 5,
+) -> str:
+    """Semantic similarity search over project memory using latent vectors.
+
+    Finds decisions and experiences that are semantically similar to the query,
+    even when keyword search would miss them. Requires sentence-transformers
+    (install with: pip install scap-engine-v2[evolution]).
+
+    Use this when keyword-based scap_recall doesn't surface what you need —
+    e.g. searching "database performance" might find "N+1 query optimization"
+    even without exact keyword overlap.
+
+    Args:
+        project: Project name
+        query: Natural language query (e.g. "database performance issues")
+        limit: Max results (default 5, max 20)
+    """
+    store = _get_store()
+    limit = min(max(limit, 1), 20)
+
+    query_vector = _try_embed(query)
+    if query_vector is None:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Embedding model not available. Install with: "
+                "pip install scap-engine-v2[evolution]"
+            ),
+        }, ensure_ascii=False)
+
+    results = store.search_by_vector(project, query_vector, limit)
+    return json.dumps({
+        "success": True,
+        "query": query,
+        "count": len(results),
+        "results": results,
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+async def scap_consolidate(
+    project: str,
+    similarity_threshold: float = 0.85,
+) -> str:
+    """Consolidate similar latent traces, advancing the evolution generation.
+
+    Finds pairs of latent traces with high cosine similarity and merges them:
+    - The higher-fitness trace survives and gets evolution_gen + 1
+    - The lower-fitness duplicate is deleted from latent_traces
+    - Original Decision/Experience records are preserved untouched
+
+    This is the "nighttime consolidation" step inspired by Mind Evolution:
+    weaker memories are pruned, stronger ones are reinforced. Call this
+    periodically (e.g. end of session) to keep the latent space clean.
+
+    Args:
+        project: Project name
+        similarity_threshold: Cosine similarity above which traces are
+            merged (default 0.85, range 0.5-0.99)
+    """
+    store = _get_store()
+    similarity_threshold = min(max(similarity_threshold, 0.5), 0.99)
+
+    traces = store.list_latent_traces(project=project, limit=500)
+    if len(traces) < 2:
+        return json.dumps({
+            "success": True,
+            "project": project,
+            "merged": 0,
+            "message": "Not enough traces to consolidate (need ≥ 2).",
+        }, ensure_ascii=False)
+
+    # Sort by fitness descending — higher fitness survives
+    traces.sort(key=lambda t: t.fitness, reverse=True)
+
+    merged_count = 0
+    survivors: list[LatentTrace] = []
+    merged_ids: list[str] = []
+
+    for trace in traces:
+        if trace.id in merged_ids:
+            continue
+
+        is_duplicate = False
+        for survivor in survivors:
+            sim = MemoryStore._cosine_similarity(trace.embedding, survivor.embedding)
+            if sim >= similarity_threshold:
+                # Survivor wins — advance its evolution generation
+                survivor.evolution_gen += 1
+                store.save_latent_trace(survivor)
+                # Prune the weaker trace
+                store.delete_latent_trace(trace.id)
+                merged_ids.append(trace.id)
+                merged_count += 1
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            survivors.append(trace)
+
+    max_gen = max((t.evolution_gen for t in survivors), default=0)
+    return json.dumps({
+        "success": True,
+        "project": project,
+        "total_traces": len(traces),
+        "merged": merged_count,
+        "surviving": len(survivors),
+        "new_evolution_gen": max_gen,
+    }, ensure_ascii=False)
+
+
+@mcp.tool()
+async def scap_evolved_context(
+    project: str,
+    task_description: str = "",
+    min_fitness: float = 0.0,
+) -> str:
+    """Retrieve evolved project context with fitness-weighted ranking.
+
+    Returns project memory ranked by latent space fitness and evolution
+    generation, showing which decisions and experiences have been
+    "evolved" (consolidated/reinforced) over time.
+
+    When task_description is provided, results are further filtered by
+    semantic similarity to the task. Use this for complex tasks where
+    you want the most refined, battle-tested context.
+
+    Args:
+        project: Project name
+        task_description: Optional task context for semantic filtering
+        min_fitness: Minimum fitness score (0.0-1.0), default 0.0 (all)
+    """
+    store = _get_store()
+    min_fitness = min(max(min_fitness, 0.0), 1.0)
+
+    traces = store.list_latent_traces(project=project, limit=500)
+    traces = [t for t in traces if t.fitness >= min_fitness]
+
+    if not traces:
+        return json.dumps({
+            "success": True,
+            "project": project,
+            "returned": 0,
+            "results": [],
+            "message": "No latent traces found for this project.",
+        }, ensure_ascii=False)
+
+    # Optional semantic filtering by task similarity
+    task_vector = _try_embed(task_description) if task_description else None
+
+    # Score: fitness * (1 + evolution_gen * 0.1) + optional similarity bonus
+    scored = []
+    for t in traces:
+        base_score = t.fitness * (1 + t.evolution_gen * 0.1)
+        if task_vector:
+            sim = MemoryStore._cosine_similarity(task_vector, t.embedding)
+            base_score += sim * 0.3  # similarity as a bonus factor
+        scored.append((base_score, t))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Build enriched results
+    results = []
+    for score, t in scored[:20]:
+        hit = {
+            "entity_id": t.entity_id,
+            "entity_type": t.entity_type,
+            "fitness": t.fitness,
+            "evolution_gen": t.evolution_gen,
+            "score": round(score, 4),
+        }
+        if t.entity_type == "decision":
+            d = store.get_decision(t.entity_id)
+            if d:
+                hit["title"] = d.title
+                hit["decision"] = d.decision[:100] if d.decision else ""
+        elif t.entity_type == "experience":
+            exp = store.get_experience(t.entity_id)
+            if exp:
+                hit["title"] = exp.situation[:80] if exp.situation else ""
+                hit["lesson"] = exp.lesson[:100] if exp.lesson else ""
+        results.append(hit)
+
+    stats = store.get_stats(project=project)
+    return json.dumps({
+        "success": True,
+        "project": project,
+        "evolution_gen": stats.get("evolution_gen", 0),
+        "total_traces": stats.get("latent_trace_count", 0),
+        "filtered_traces": len(traces),
+        "returned": len(results),
+        "results": results,
     }, ensure_ascii=False)
 
 

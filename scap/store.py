@@ -1,14 +1,20 @@
-"""SCAP v2 — SQLite + FTS5 storage layer.
+"""SCAP v2 — SQLite + FTS5 storage layer with latent vector support.
 
 Reuses proven patterns from v1:
   - WAL mode for concurrent reads
   - FTS5 full-text search with Chinese fallback (bigram)
   - Thread-safe connection lazy init
+
+Phase 1 additions:
+  - latent_traces table for vector storage
+  - Four-tier search fallback: exact → FTS5 → vector similarity → LIKE
+  - Cosine similarity in pure Python (no numpy dependency)
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -16,7 +22,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from scap.models import Decision, ProjectContext, Experience
+from scap.models import Decision, ProjectContext, Experience, LatentTrace
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +94,20 @@ class MemoryStore:
             );
             CREATE INDEX IF NOT EXISTS idx_exp_project ON experiences(project);
 
+            CREATE TABLE IF NOT EXISTS latent_traces (
+                id TEXT PRIMARY KEY,
+                entity_id TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                project TEXT NOT NULL,
+                embedding TEXT NOT NULL DEFAULT '[]',
+                fitness REAL NOT NULL DEFAULT 0.5,
+                evolution_gen INTEGER NOT NULL DEFAULT 0,
+                source_tasks TEXT DEFAULT '[]',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_lt_project ON latent_traces(project);
+            CREATE INDEX IF NOT EXISTS idx_lt_entity ON latent_traces(entity_id);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                 entity_id UNINDEXED,
                 entity_type UNINDEXED,
@@ -109,7 +129,11 @@ class MemoryStore:
             ("decisions", "constraints", "TEXT DEFAULT '[]'"),
             ("decisions", "tags", "TEXT DEFAULT '[]'"),
             ("decisions", "superseded_by", "TEXT"),
+            ("decisions", "embedding", "TEXT"),
+            ("decisions", "evolution_gen", "INTEGER DEFAULT 0"),
             ("experiences", "tags", "TEXT DEFAULT '[]'"),
+            ("experiences", "embedding", "TEXT"),
+            ("experiences", "evolution_gen", "INTEGER DEFAULT 0"),
         ]
         for table, col, col_type in _migrations:
             try:
@@ -155,8 +179,8 @@ class MemoryStore:
                 """INSERT OR REPLACE INTO decisions
                    (id, project, title, context, decision, rationale,
                     alternatives, constraints, status, superseded_by, tags,
-                    created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    created_at, updated_at, embedding, evolution_gen)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     d.id, d.project, d.title, d.context, d.decision, d.rationale,
                     json.dumps(d.alternatives, ensure_ascii=False),
@@ -164,6 +188,8 @@ class MemoryStore:
                     d.status, d.superseded_by,
                     json.dumps(d.tags, ensure_ascii=False),
                     d.created_at.isoformat(), d.updated_at.isoformat(),
+                    json.dumps(d.embedding) if d.embedding else None,
+                    d.evolution_gen,
                 ),
             )
             self._sync_fts(d.id, "decision", d.project,
@@ -222,6 +248,8 @@ class MemoryStore:
             tags=json.loads(r["tags"]),
             created_at=datetime.fromisoformat(r["created_at"]),
             updated_at=datetime.fromisoformat(r["updated_at"]),
+            embedding=json.loads(r["embedding"]) if r["embedding"] else None,
+            evolution_gen=r["evolution_gen"] if "evolution_gen" in r.keys() else 0,
         )
 
     # ── ProjectContext CRUD ──
@@ -268,12 +296,15 @@ class MemoryStore:
 
             self.conn.execute(
                 """INSERT OR REPLACE INTO experiences
-                   (id, project, situation, action, lesson, tags, created_at)
-                   VALUES (?,?,?,?,?,?,?)""",
+                   (id, project, situation, action, lesson, tags, created_at,
+                    embedding, evolution_gen)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (
                     e.id, e.project, e.situation, e.action, e.lesson,
                     json.dumps(e.tags, ensure_ascii=False),
                     e.created_at.isoformat(),
+                    json.dumps(e.embedding) if e.embedding else None,
+                    e.evolution_gen,
                 ),
             )
             self._sync_fts(e.id, "experience", e.project,
@@ -283,10 +314,27 @@ class MemoryStore:
             self.conn.commit()
         return e
 
+    def get_experience(self, experience_id: str) -> Optional[Experience]:
+        """Get a single experience by ID."""
+        row = self.conn.execute(
+            "SELECT * FROM experiences WHERE id = ?", (experience_id,)
+        ).fetchone()
+        return self._row_to_experience(row) if row else None
+
     # ── Search ──
 
-    def search(self, project: str, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """FTS5 full-text search, optionally project-scoped."""
+    def search(self, project: str, query: str, limit: int = 10,
+               query_vector: Optional[List[float]] = None) -> List[Dict[str, Any]]:
+        """Four-tier search: FTS5 → CJK bigram FTS5 → vector similarity → LIKE.
+
+        Args:
+            project: Optional project scope filter.
+            query: Text query for FTS5/LIKE search.
+            limit: Maximum results to return.
+            query_vector: Optional embedding vector for semantic similarity search.
+                         When provided and FTS5 returns no results, falls back to
+                         vector similarity before LIKE search.
+        """
         has_project = bool(project and project.strip())
         # Build FTS query: try original, then CJK bigram fallback
         queries_to_try = [query]
@@ -316,7 +364,13 @@ class MemoryStore:
             except sqlite3.OperationalError:
                 continue
 
-        # Fallback: LIKE search
+        # Tier 3: Vector similarity search (if query vector provided)
+        if query_vector:
+            vec_results = self.search_by_vector(project, query_vector, limit)
+            if vec_results:
+                return vec_results
+
+        # Tier 4: Fallback LIKE search
         return self._like_search(project, query, limit)
 
     def _like_search(self, project: str, query: str, limit: int) -> List[Dict[str, Any]]:
@@ -393,6 +447,163 @@ class MemoryStore:
                 hit["snippet"] = row_exp["lesson"][:150]
         return hit
 
+    # ── LatentTrace CRUD (Phase 1) ──
+
+    def save_latent_trace(self, trace: LatentTrace) -> LatentTrace:
+        """Save or update a latent trace record."""
+        with self._lock:
+            if not trace.id:
+                trace.id = self._next_id("LT", "latent_traces")
+            if not trace.created_at:
+                trace.created_at = datetime.now(timezone.utc)
+
+            self.conn.execute(
+                """INSERT OR REPLACE INTO latent_traces
+                   (id, entity_id, entity_type, project, embedding,
+                    fitness, evolution_gen, source_tasks, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    trace.id, trace.entity_id, trace.entity_type,
+                    trace.project,
+                    json.dumps(trace.embedding),
+                    trace.fitness, trace.evolution_gen,
+                    json.dumps(trace.source_tasks, ensure_ascii=False),
+                    trace.created_at.isoformat(),
+                ),
+            )
+            self.conn.commit()
+        return trace
+
+    def get_latent_trace(self, trace_id: str) -> Optional[LatentTrace]:
+        """Get a latent trace by ID."""
+        row = self.conn.execute(
+            "SELECT * FROM latent_traces WHERE id = ?", (trace_id,)
+        ).fetchone()
+        return self._row_to_latent_trace(row) if row else None
+
+    def delete_latent_trace(self, trace_id: str) -> bool:
+        """Delete a latent trace by ID. Returns True if a row was deleted."""
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM latent_traces WHERE id = ?", (trace_id,)
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def list_latent_traces(self, project: str = "", entity_id: str = "",
+                           limit: int = 50) -> List[LatentTrace]:
+        """List latent traces, optionally filtered by project or entity."""
+        clauses, params = [], []
+        if project:
+            clauses.append("project = ?")
+            params.append(project)
+        if entity_id:
+            clauses.append("entity_id = ?")
+            params.append(entity_id)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM latent_traces{where} ORDER BY created_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return [self._row_to_latent_trace(r) for r in rows]
+
+    def search_by_vector(self, project: str, query_vector: List[float],
+                         limit: int = 10,
+                         min_similarity: float = 0.15) -> List[Dict[str, Any]]:
+        """Vector similarity search using cosine similarity.
+
+        Loads all traces (optionally project-scoped) and ranks by cosine
+        similarity to the query vector. Pure Python, no numpy required.
+
+        Args:
+            min_similarity: Minimum cosine similarity to include (default 0.15).
+                           Real embedding models produce non-zero similarity
+                           for nearly all text pairs; this threshold filters
+                           noise. Increase to 0.3+ for higher precision.
+        """
+        if not query_vector:
+            return []
+
+        has_project = bool(project and project.strip())
+        if has_project:
+            rows = self.conn.execute(
+                "SELECT * FROM latent_traces WHERE project = ? ORDER BY created_at DESC",
+                (project,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM latent_traces ORDER BY created_at DESC"
+            ).fetchall()
+
+        if not rows:
+            return []
+
+        scored = []
+        for row in rows:
+            embedding = json.loads(row["embedding"])
+            if not embedding:
+                continue
+            sim = self._cosine_similarity(query_vector, embedding)
+            scored.append((sim, row))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        results = []
+        for sim, row in scored[:limit]:
+            if sim < min_similarity:
+                continue
+            hit = {
+                "entity_id": row["entity_id"],
+                "entity_type": row["entity_type"],
+                "similarity": round(sim, 4),
+                "evolution_gen": row["evolution_gen"],
+                "fitness": row["fitness"],
+            }
+            # Enrich with entity data
+            if row["entity_type"] == "decision":
+                d = self.get_decision(row["entity_id"])
+                if d:
+                    hit["title"] = d.title
+                    hit["snippet"] = f"{d.decision[:100]}. 理由: {d.rationale[:80]}"
+                    hit["status"] = d.status
+            elif row["entity_type"] == "experience":
+                exp_row = self.conn.execute(
+                    "SELECT * FROM experiences WHERE id = ?", (row["entity_id"],)
+                ).fetchone()
+                if exp_row:
+                    hit["title"] = exp_row["situation"][:80]
+                    hit["snippet"] = exp_row["lesson"][:150]
+            results.append(hit)
+
+        return results
+
+    @staticmethod
+    def _row_to_latent_trace(r) -> LatentTrace:
+        """Convert a SQLite row to a LatentTrace model."""
+        return LatentTrace(
+            id=r["id"],
+            entity_id=r["entity_id"],
+            entity_type=r["entity_type"],
+            project=r["project"],
+            embedding=json.loads(r["embedding"]),
+            fitness=r["fitness"],
+            evolution_gen=r["evolution_gen"],
+            source_tasks=json.loads(r["source_tasks"]),
+            created_at=datetime.fromisoformat(r["created_at"]),
+        )
+
+    @staticmethod
+    def _cosine_similarity(v1: List[float], v2: List[float]) -> float:
+        """Compute cosine similarity between two vectors (pure Python)."""
+        if not v1 or not v2 or len(v1) != len(v2):
+            return 0.0
+        dot = sum(a * b for a, b in zip(v1, v2))
+        norm1 = math.sqrt(sum(a * a for a in v1))
+        norm2 = math.sqrt(sum(b * b for b in v2))
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot / (norm1 * norm2)
+
     # ── FTS sync ──
 
     def _sync_fts(self, entity_id: str, entity_type: str, project: str,
@@ -436,6 +647,12 @@ class MemoryStore:
         exp_count = self.conn.execute(
             f"SELECT COUNT(*) FROM experiences{where}", params
         ).fetchone()[0]
+        lt_count = self.conn.execute(
+            f"SELECT COUNT(*) FROM latent_traces{where}", params
+        ).fetchone()[0]
+        max_gen = self.conn.execute(
+            f"SELECT COALESCE(MAX(evolution_gen), 0) FROM latent_traces{where}", params
+        ).fetchone()[0]
 
         projects = list(set(
             [r[0] for r in self.conn.execute(
@@ -449,6 +666,8 @@ class MemoryStore:
         return {
             "decision_count": dec_count,
             "experience_count": exp_count,
+            "latent_trace_count": lt_count,
+            "evolution_gen": max_gen,
             "projects": projects,
         }
 
@@ -540,4 +759,6 @@ class MemoryStore:
             lesson=r["lesson"],
             tags=json.loads(r["tags"]),
             created_at=datetime.fromisoformat(r["created_at"]),
+            embedding=json.loads(r["embedding"]) if r["embedding"] else None,
+            evolution_gen=r["evolution_gen"] if "evolution_gen" in r.keys() else 0,
         )

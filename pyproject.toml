@@ -1,14 +1,14 @@
 [project]
 name = "scap-engine"
-version = "2.0.0"
-description = "SCAP — Project Memory System. Externalizes model knowledge into structured decision records for cross-session consistency."
+version = "2.1.0"
+description = "SCAP — Project Memory System with latent space evolution. Externalizes model knowledge into structured decision records for cross-session consistency."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     {name = "MindForge07", email = "your.email@example.com"}
 ]
-keywords = ["AI", "memory", "knowledge-management", "MCP", "project-memory"]
+keywords = ["AI", "memory", "knowledge-management", "MCP", "project-memory", "latent-space", "evolution"]
 
 dependencies = [
     "pydantic>=2.0",
@@ -22,6 +22,9 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+]
+evolution = [
+    "sentence-transformers>=2.2",
 ]
 
 [project.urls]
