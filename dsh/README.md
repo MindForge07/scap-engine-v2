@@ -5,23 +5,41 @@
 DSH 的 agent-loop 在每个 step 的 `assemble()` 后把它物化为 durable user message
 （内容不变不重复注入），AI 从第一句话就能看到项目记忆——**零工具调用、零 API 开销**。
 
-## 工作原理
+## 工作原理（分层注入 L0/L1/L2）
 
 ```
 scap_remember / scap_record_experience（MCP 工具）
    │  写入
    ▼
-SQLite + 自动导出 .scap/{project}.md
-   │  scap-injection 插件（本文件）读取
+SQLite + 自动导出 .scap/{project}.md + .scap/{project}.json（结构化投影）
+   │  scap-injection 插件（本文件）读取 JSON
    ▼
-DSH systemPrompt.context('scap:project-memory')
-   │  agent-loop 每 step assemble
+L0 项目卡片（常驻）：Tech Stack / Conventions / Insights
+L1 任务相关预检索（自动，零 LLM）：
+   读取最近 user message → 与 scap recall 同一套打分器
+   （CJK bigram + 拉丁词 + IDF + recency 衰减 + importance 加成）
+   → top-N 相关决策 + 常驻决策（importance≥4 或近 7 天）换入注入内容
+   → 相关经验 top-2
+L2 深度召回（模型自觉）：scap_recall / scap_retrieve_latent 工具
+   │
    ▼
-RuntimeContextProjection → durable user message → LLM 上下文
+DSH systemPrompt.context → agent-loop 每 step assemble
+   → RuntimeContextProjection 物化为 durable user message（内容不变不重复注入）
+   → LLM 上下文
    │  记忆影响行为
    ▼
-新决策 → 又调用 scap_remember → 新 .scap/{project}.md → 下一 step 自动刷新
+新决策 → 又调用 scap_remember → 新 .scap/{project}.json → 下一 step 自动刷新
 ```
+
+**为什么 L1 用规则召回而非 LLM/代理**：L1 发生在每个 step（高频路径），LLM
+只该花在低频任务（反思/归档/深度检索）上——规则召回零成本、确定性、可测试，
+且决策记忆本身就是项目术语的集合（关键词+IDF+recency 已抓住主要信号），
+语义长尾由可选 embedding 覆盖。这与 Generative Agents 三因子加权检索、
+Mem0 读取路径规则化是同一选择。
+
+**数据通路**：注入插件读 `.scap/{project}.json`（scap 导出时同步生成，
+含 importance/status/时间戳的结构化投影），与 SQLite 解耦、零依赖；
+旧目录只有 md 时自动回退全量注入（向后兼容）。
 
 ## 挂载（零改动 Harness）
 
@@ -51,9 +69,13 @@ RuntimeContextProjection → durable user message → LLM 上下文
 | 键 | 缺省 | 说明 |
 |---|---|---|
 | `scapDir` | 自动向上查找 | 显式指定 `.scap` 目录；自动查找时**到达项目根（`.git`）即停止**，不会逃出项目找到无关的 `.scap` |
-| `project` | cwd basename | 项目名，读取 `{scapDir}/{project}.md` |
+| `project` | cwd basename | 项目名，读取 `{scapDir}/{project}.md/.json` |
 | `maxChars` | 0（不限） | 注入文本字符上限 |
 | `heading` | `[SCAP Project Memory]` | 快照标题行；空串不输出 |
+| `recallTopN` | 5 | L1 任务相关决策数量上限（1-20） |
+| `residentImportance` | 4 | importance ≥ 该值的 active 决策作为常驻决策强制注入 |
+| `residentMaxAgeDays` | 7 | 更新距今 ≤ 该天数的决策作为常驻决策强制注入 |
+| `useTaskRecall` | true | 启用 L1 任务相关预检索；false = 只注入卡片 + 常驻决策 |
 
 ## 验证
 

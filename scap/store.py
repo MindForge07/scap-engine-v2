@@ -732,7 +732,7 @@ class MemoryStore:
     # ── Context export ──
 
     def export_context(self, project: str, output_path: str,
-                       max_chars: int = 0) -> str:
+                       max_chars: int = 0, with_json: bool = True) -> str:
         """Export project context as a markdown file for system prompt injection.
 
         This file is meant to be included in the AI's system prompt so that
@@ -742,6 +742,11 @@ class MemoryStore:
         emitted newest-first and emission stops once the budget is exhausted,
         so a large project cannot blow up the system prompt. Decisions that
         repeat an already-emitted (title, decision) pair are folded away.
+
+        with_json also writes a machine-readable companion projection
+        `{stem}.json` beside the markdown, so layer-aware injectors
+        (dsh/scap-injection) can do task-relevance ranking locally instead of
+        injecting the full projection.
 
         Returns the path of the written file.
         """
@@ -829,7 +834,63 @@ class MemoryStore:
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
 
+        if with_json:
+            # JSON projection carries ALL decisions (incl. superseded) so
+            # layer-aware injectors can filter by status themselves; the
+            # markdown stays active-only.
+            all_decisions = self.list_decisions(
+                project=project, limit=200, importance_first=True,
+            )
+            self._export_json(project, output_path, ctx, all_decisions, experiences)
+
         return output_path
+
+    def _export_json(self, project: str, output_path: str, ctx,
+                     decisions, experiences) -> str:
+        """Write the machine-readable companion projection for layer-aware
+        injectors (dsh/scap-injection): structured decisions/experiences with
+        importance, status and timestamps for local relevance ranking.
+
+        Returns the JSON path (same directory as output_path, `.json` stem).
+        """
+        json_path = os.path.splitext(output_path)[0] + ".json"
+        payload = {
+            "project": project,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "context": {
+                "tech_stack": ctx.tech_stack if ctx else [],
+                "conventions": ctx.conventions if ctx else [],
+                "active_goals": ctx.active_goals if ctx else [],
+                "insights": ctx.insights if ctx else [],
+            },
+            "decisions": [
+                {
+                    "id": d.id,
+                    "title": d.title,
+                    "decision": d.decision,
+                    "rationale": d.rationale,
+                    "status": d.status,
+                    "importance": d.importance,
+                    "created_at": d.created_at.isoformat(),
+                    "updated_at": d.updated_at.isoformat(),
+                }
+                for d in decisions
+            ],
+            "experiences": [
+                {
+                    "id": e.id,
+                    "situation": e.situation,
+                    "action": e.action,
+                    "lesson": e.lesson,
+                    "importance": e.importance,
+                    "created_at": e.created_at.isoformat(),
+                }
+                for e in experiences
+            ],
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=1)
+        return json_path
 
     def list_experiences(self, project: str = "", limit: int = 50) -> List[Experience]:
         """List experience records, optionally project-scoped."""

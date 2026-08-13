@@ -1,11 +1,12 @@
 """P0 memory-quality tests: importance/quality gate, recency decay, fitness loop."""
 import json
 import math
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from scap.models import Decision, Experience
+from scap.models import Decision, Experience, ProjectContext
 from scap.store import MemoryStore
 from scap.mcp_server import (
     _decision_relevance,
@@ -238,3 +239,52 @@ class TestExportImportanceOrder:
         store.export_context("p", out)
         content = open(out, encoding="utf-8").read()
         assert content.index("高重要") < content.index("低重要")
+
+
+# ── machine-readable JSON projection (L1 layered injection) ──
+
+class TestExportJson:
+    def test_json_projection_contains_structured_fields(self, store: MemoryStore, tmp_path):
+        store.save_decision(Decision(
+            project="p", title="选型", decision="Kafka",
+            rationale="理由", importance=5,
+        ))
+        store.save_experience(Experience(
+            project="p", situation="S", action="A", lesson="L", importance=4,
+        ))
+        store.update_project_context(ProjectContext(
+            project="p", tech_stack=["PostgreSQL"], insights=["洞察一"],
+        ))
+        out = str(tmp_path / "p.md")
+        store.export_context("p", out)
+        json_path = str(tmp_path / "p.json")
+        assert os.path.exists(json_path)
+        payload = json.load(open(json_path, encoding="utf-8"))
+        assert payload["project"] == "p"
+        assert payload["context"]["tech_stack"] == ["PostgreSQL"]
+        assert payload["context"]["insights"] == ["洞察一"]
+        assert len(payload["decisions"]) == 1
+        d = payload["decisions"][0]
+        assert d["title"] == "选型"
+        assert d["importance"] == 5
+        assert d["status"] == "active"
+        assert "created_at" in d and "updated_at" in d
+        assert len(payload["experiences"]) == 1
+        assert payload["experiences"][0]["lesson"] == "L"
+        assert payload["experiences"][0]["importance"] == 4
+
+    def test_json_superseded_decisions_included_with_status(self, store: MemoryStore, tmp_path):
+        old = store.save_decision(Decision(project="p", title="选型", decision="A", rationale="r"))
+        new = Decision(project="p", title="选型", decision="B", rationale="r2")
+        store.supersede(old.id, new)
+        out = str(tmp_path / "p.md")
+        store.export_context("p", out)
+        payload = json.load(open(str(tmp_path / "p.json"), encoding="utf-8"))
+        statuses = {d["status"] for d in payload["decisions"]}
+        assert statuses == {"superseded", "active"}
+
+    def test_json_disabled(self, store: MemoryStore, tmp_path):
+        store.save_decision(Decision(project="p", title="t", decision="d"))
+        out = str(tmp_path / "p.md")
+        store.export_context("p", out, with_json=False)
+        assert not os.path.exists(str(tmp_path / "p.json"))
