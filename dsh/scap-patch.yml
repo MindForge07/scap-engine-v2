@@ -1,0 +1,17 @@
+# SCAP 记忆注入挂载层（官方方式：`dsh web --patch <本文件>`，或并入 cordis.patch.yml）
+#
+# 零改动 Harness：按文件路径挂载用户态插件 dsh/scap-injection.ts。
+# 生效时机：下次启动 DSH 时（web bundle 未挂 HMR，运行中实例不受影响）。
+#
+# 用法：
+#   pnpm dsh web --patch C:/Users/XDXLC/openclaw/scap-engine-v2/dsh/scap-patch.yml
+# 验证合成（不启动）：
+#   pnpm dsh web --dump-config --patch C:/Users/XDXLC/openclaw/scap-engine-v2/dsh/scap-patch.yml
+- insert:
+    - id: scap-injection
+      name: file:///C:/Users/XDXLC/openclaw/scap-engine-v2/dsh/scap-injection.ts
+      config:
+        heading: "[SCAP Project Memory]"
+        # scapDir / project / maxChars 缺省即可：
+        #   - 自动向上查找 .scap（项目根 .git 为界）
+        #   - 项目名 = 会话 cwd 的 basename
