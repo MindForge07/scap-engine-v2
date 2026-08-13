@@ -186,13 +186,15 @@ def ingest_cmd(ctx: click.Context, file_path: str) -> None:
 @cli.command()
 @click.option("--project", "-p", required=True, help="Project to export")
 @click.option("--output", "-o", default="", help="Output path (default: .scap/{project}.md)")
+@click.option("--max-chars", default=0, type=int,
+              help="Cap on rendered markdown size in characters (0 = uncapped)")
 @click.pass_context
-def export(ctx: click.Context, project: str, output: str) -> None:
+def export(ctx: click.Context, project: str, output: str, max_chars: int) -> None:
     """Export project context to a markdown file for system prompt injection."""
     store: MemoryStore = ctx.obj["store"]
     if not output:
         output = os.path.join(_EXPORT_DIR, f"{project}.md")
-    path = store.export_context(project, output)
+    path = store.export_context(project, output, max_chars=max_chars)
     console.print(f"[green]✓[/green] Exported to: {path}")
 
     # Show preview

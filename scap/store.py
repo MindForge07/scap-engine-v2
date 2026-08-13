@@ -673,62 +673,92 @@ class MemoryStore:
 
     # ── Context export ──
 
-    def export_context(self, project: str, output_path: str) -> str:
+    def export_context(self, project: str, output_path: str,
+                       max_chars: int = 0) -> str:
         """Export project context as a markdown file for system prompt injection.
 
         This file is meant to be included in the AI's system prompt so that
         scap_recall becomes unnecessary — the context is pre-loaded.
 
+        max_chars bounds the rendered markdown (0 = uncapped): entries are
+        emitted newest-first and emission stops once the budget is exhausted,
+        so a large project cannot blow up the system prompt. Decisions that
+        repeat an already-emitted (title, decision) pair are folded away.
+
         Returns the path of the written file.
         """
-        lines = [f"# Project Memory: {project}", ""]
+        lines: list[str] = []
+        budget_used = 0
+
+        def add(text: str) -> bool:
+            """Append one block; False when the max_chars budget is exhausted."""
+            nonlocal budget_used
+            if max_chars > 0 and text and budget_used + len(text) > max_chars:
+                return False
+            lines.append(text)
+            budget_used += len(text)
+            return True
+
+        add(f"# Project Memory: {project}")
+        add("")
 
         ctx = self.get_project_context(project)
         if ctx:
             if ctx.tech_stack:
-                lines.append(f"## Tech Stack\n{', '.join(ctx.tech_stack)}\n")
+                add(f"## Tech Stack\n{', '.join(ctx.tech_stack)}")
+                add("")
             if ctx.conventions:
-                lines.append("## Conventions")
+                add("## Conventions")
                 for c in ctx.conventions:
-                    lines.append(f"- {c}")
-                lines.append("")
+                    if not add(f"- {c}"):
+                        break
+                add("")
             if ctx.active_goals:
-                lines.append("## Active Goals")
+                add("## Active Goals")
                 for g in ctx.active_goals:
-                    lines.append(f"- {g}")
-                lines.append("")
+                    if not add(f"- {g}"):
+                        break
+                add("")
 
         decisions = self.list_decisions(project=project, status="active", limit=200)
+        seen_pairs: set[tuple[str, str]] = set()
         if decisions:
-            lines.append("## Decisions")
+            add("## Decisions")
             for d in decisions:
-                lines.append(f"\n### {d.title} ({d.created_at.strftime('%Y-%m-%d')})")
+                pair = (d.title, d.decision)
+                if pair in seen_pairs:
+                    continue  # fold exact duplicates
+                block = [f"\n### {d.title} ({d.created_at.strftime('%Y-%m-%d')})"]
                 if d.decision:
-                    lines.append(f"**Chosen:** {d.decision}")
+                    block.append(f"**Chosen:** {d.decision}")
                 if d.rationale:
-                    lines.append(f"**Why:** {d.rationale}")
+                    block.append(f"**Why:** {d.rationale}")
                 if d.alternatives:
                     for alt in d.alternatives:
                         name = alt.get("name", "?")
                         reason = alt.get("reason_rejected", "")
-                        lines.append(f"- ~~{name}~~ (rejected: {reason})")
+                        block.append(f"- ~~{name}~~ (rejected: {reason})")
                 if d.constraints:
-                    lines.append(f"**Constraints:** {', '.join(d.constraints)}")
-            lines.append("")
+                    block.append(f"**Constraints:** {', '.join(d.constraints)}")
+                if not add("\n".join(block)):
+                    break
+                seen_pairs.add(pair)
+            add("")
 
         experiences = self.list_experiences(project=project, limit=50)
         if experiences:
-            lines.append("## Lessons Learned")
+            add("## Lessons Learned")
             for exp in experiences:
-                lines.append(f"\n- **{exp.situation}**")
+                block = [f"\n- **{exp.situation}**"]
                 if exp.action:
-                    lines.append(f"  Action: {exp.action}")
-                lines.append(f"  → {exp.lesson}")
-            lines.append("")
+                    block.append(f"  Action: {exp.action}")
+                block.append(f"  → {exp.lesson}")
+                if not add("\n".join(block)):
+                    break
+            add("")
 
         content = "\n".join(lines)
 
-        import os
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)

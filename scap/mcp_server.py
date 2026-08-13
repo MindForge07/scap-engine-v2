@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import re
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -54,10 +56,15 @@ def _ensure_project(store: MemoryStore, project: str) -> None:
 
 
 def _auto_export(store: MemoryStore, project: str) -> None:
-    """Export context.md after each write. Cheap operation (< 1ms)."""
+    """Export context.md after each write. Cheap operation (< 1ms).
+
+    SCAP_EXPORT_MAX_CHARS caps the rendered markdown (0 = uncapped), keeping
+    the exported context.md bounded for system-prompt injection.
+    """
     try:
         path = os.path.join(_EXPORT_DIR, f"{project}.md")
-        store.export_context(project, path)
+        max_chars = int(os.environ.get("SCAP_EXPORT_MAX_CHARS", "0") or 0)
+        store.export_context(project, path, max_chars=max_chars)
     except Exception as e:
         logger.debug(f"Context export skipped: {e}")
 
@@ -98,6 +105,85 @@ def _save_trace(store: MemoryStore, entity) -> None:
     logger.debug(f"LatentTrace saved for {entity_type} {entity.id}")
 
 
+# ── Task-relevance scoring (dependency-free) ──
+
+_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
+_LATIN_TOKEN_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _task_match_terms(text: str) -> list[str]:
+    """Extract matching terms from a query/task string.
+
+    CJK text becomes overlapping character bigrams ("消息队列" → 消息, 息队, 队列),
+    so natural-language Chinese queries stay matchable without a tokenizer.
+    Latin words are kept only when at least two characters long: a stray single
+    letter like 'a' otherwise matches inside 'kafka'/'react' and pollutes the
+    ranking. Returns [] for text with no usable terms.
+    """
+    lower = text.lower()
+    terms: list[str] = []
+    for word in _LATIN_TOKEN_RE.findall(lower):
+        if len(word) >= 2:
+            terms.append(word)
+    cjk = _CJK_CHAR_RE.findall(lower)
+    terms.extend(cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1))
+    return terms
+
+
+# Lexical relevance below this share of weighted task terms counts as
+# incidental overlap (e.g. a lone common bigram like "系统" or "选择"),
+# not relevance. 0.15 ≈ one meaningful term out of ~7.
+_RELEVANCE_LEXICAL_FLOOR = 0.15
+
+
+def _term_idf(terms: list[str], corpus_texts: list[str]) -> dict[str, float]:
+    """Inverse-document-frequency weights for query terms over a corpus.
+
+    Common terms that appear in many candidate decisions carry little
+    relevance signal and get small weights; rare terms dominate. Terms absent
+    from the corpus keep the full idf, so a genuine match is never
+    down-weighted.
+    """
+    n = max(len(corpus_texts), 1)
+    df: dict[str, int] = {}
+    for text in corpus_texts:
+        present = {t for t in terms if t in text}
+        for t in present:
+            df[t] = df.get(t, 0) + 1
+    return {t: math.log(1 + n / (1 + df.get(t, 0))) for t in terms}
+
+
+def _decision_relevance(task: str, decision_text: str,
+                        query_vector: Optional[List[float]],
+                        embedding: Optional[List[float]],
+                        idf: Optional[dict[str, float]] = None) -> float:
+    """Relevance of one decision against a task, 0..1.
+
+    The relevance floor is judged on the PLAIN hit ratio — fewer than ~1/7 of
+    the task's terms is incidental overlap, not relevance — while the score
+    itself is idf-weighted when a corpus idf map is supplied, so common terms
+    ("系统", "选择") contribute little to ranking. When both a query vector and
+    a decision embedding are present the vectors dominate the blend; otherwise
+    the lexical term is the whole score.
+    """
+    terms = _task_match_terms(task)
+    lexical = 0.0
+    if terms:
+        haystack = decision_text.lower()
+        matched_count = sum(1 for t in terms if t in haystack)
+        if matched_count / len(terms) >= _RELEVANCE_LEXICAL_FLOOR:
+            if idf is not None:
+                total = sum(idf.values())
+                lexical = (sum(w for t, w in idf.items() if t in haystack) / total
+                           if total > 0 else 0.0)
+            else:
+                lexical = matched_count / len(terms)
+    if query_vector is not None and embedding:
+        vec_sim = MemoryStore._cosine_similarity(query_vector, embedding)
+        return 0.6 * max(vec_sim, 0.0) + 0.4 * lexical
+    return lexical
+
+
 def _format_recall(store: MemoryStore, project: str, task: str,
                    query_vector: Optional[List[float]] = None) -> str:
     """Format project memory as injection-ready text for LLM system prompt.
@@ -122,16 +208,23 @@ def _format_recall(store: MemoryStore, project: str, task: str,
             for g in ctx.active_goals:
                 lines.append(f"- {g}")
 
-    # 2. Relevant decisions — score by keyword overlap with task
+    # 2. Relevant decisions — lexical (idf-weighted) + optional vector
+    # relevance. Only decisions above the relevance floor are injected; small
+    # projects no longer dump everything regardless of the task.
     all_decisions = store.list_decisions(project=project, status="active", limit=200)
-    task_words = set(task.lower().split())
+    corpus_texts = [
+        f"{d.title} {d.decision} {d.rationale} {' '.join(d.constraints)}"
+        for d in all_decisions
+    ]
+    idf = _term_idf(_task_match_terms(task), corpus_texts)
     scored = []
     for d in all_decisions:
-        d_text = f"{d.title} {d.decision} {d.rationale} {' '.join(d.constraints)}".lower()
-        overlap = sum(1 for w in task_words if w in d_text)
-        scored.append((overlap, d))
+        d_text = f"{d.title} {d.decision} {d.rationale} {' '.join(d.constraints)}"
+        score = _decision_relevance(task, d_text, query_vector, d.embedding, idf=idf)
+        if score > 0:
+            scored.append((score, d))
     scored.sort(key=lambda x: -x[0])
-    relevant = [d for score, d in scored[:5] if score > 0 or len(scored) <= 3]
+    relevant = [d for _, d in scored[:5]]
 
     if relevant:
         lines.append("\n## 相关历史决策")
@@ -148,6 +241,10 @@ def _format_recall(store: MemoryStore, project: str, task: str,
                     lines.append(f"   - 备选: {name}（否决: {reason}）")
             if d.constraints:
                 lines.append(f"   - 约束: {', '.join(d.constraints)}")
+    elif all_decisions:
+        lines.append(
+            f"\n项目已有 {len(all_decisions)} 条决策记录，但与任务「{task}」不相关，未注入。"
+        )
 
     # 3. Relevant experiences — vector search when available
     exp_results = store.search(project, task, limit=3, query_vector=query_vector)
@@ -160,6 +257,14 @@ def _format_recall(store: MemoryStore, project: str, task: str,
             lines.append(f"- {title}: {snippet}")
 
     if not lines:
+        stats = store.get_stats(project=project)
+        total = stats["decision_count"] + stats["experience_count"]
+        if total:
+            return (
+                f"项目 '{project}' 已有 {stats['decision_count']} 条决策、"
+                f"{stats['experience_count']} 条经验，但与任务「{task}」不相关。"
+                f"需要语义检索时可用 scap_retrieve_latent。"
+            )
         return f"项目 '{project}' 暂无相关记录。这是该项目的第一条记录，直接开始工作即可。"
 
     return "\n".join(lines)
