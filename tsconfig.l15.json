@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"],
+    "typeRoots": ["C:/Users/XDXLC/DeepSeek Harness/deepseek-harness/node_modules/@types"]
+  },
+  "files": ["dsh/scap-injection.ts"]
+}

@@ -78,6 +78,9 @@ Mem0 读取路径规则化是同一选择。
 | `residentImportance` | 4 | importance ≥ 该值的 active 决策作为常驻决策强制注入 |
 | `residentMaxAgeDays` | 7 | 更新距今 ≤ 该天数的决策作为常驻决策强制注入 |
 | `useTaskRecall` | true | 启用 L1 任务相关预检索；false = 只注入卡片 + 常驻决策 |
+| `assocLane` | false | 启用 L1.5 联想通道（跨域结构召回）。**价值实验已证伪当前形式**（新颖性 2.50 vs 基线 2.83，可行性 3.83 vs 4.33），保持关闭；重新设计见 `bisociation-design.md` §6 |
+| `assocTopN` | 1 | L1.5 联想线索条数上限（1-5） |
+| `assocMechanisms` | 内置 12 机制 | 机制词典覆盖/扩展（`Mechanism[]`） |
 
 ## 历史积累迁移（v1 时代 → 当前格式）
 

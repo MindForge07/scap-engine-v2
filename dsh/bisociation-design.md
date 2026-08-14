@@ -99,11 +99,41 @@ L1.5 可以按结构索引召回。
 
 - [x] 联想池素材：13 个 CA 资产已迁入 XDXLC（importance=2，CA-0179=4）
 - [x] 元模式可检索：lesson 内嵌（元模式：X）格式
-- [ ] 机制词典（内建 ~20 词 + 可扩展）
-- [ ] scap-injection.ts L1.5 实现 + 配置项
-- [ ] 价值实验（上节方案）→ 通过后默认开启
+- [x] **L1.5 已实现**（`scap-injection.ts`）：
+  - 机制词典 `DEFAULT_MECHANISMS`（12 机制 × 触发词 × 结构词，可扩展）
+  - `matchMechanisms` / `isPoolAsset` / `findAssociativeCues`（纯规则零 LLM）
+  - 配置：`assocLane`（默认 false）、`assocTopN`、`assocMechanisms`
+  - 注入格式：`## 联想线索（跨域）` + `[联想]` 标注 + 元模式内嵌
+- [x] 纯逻辑测试 `dsh/verify/l15-check.ts`（9 断言，零 LLM 确定性）
+- [x] 生产数据验证：同步方案→CA-0188、限流→CA-0180、无关任务零召回
+- [x] **价值实验**（`dsh/verify/creativity-exp.ps1` + `judge-only.ps1`）：3 任务 × 2 组 × 2 次 + 盲评
 
-## 6. 相关来源
+## 6. 价值实验结果（2026-08-14）：假设被证伪
+
+**结论：联想线索（当前实现形式）不提升新颖性，甚至略降。`assocLane` 保持默认关闭。**
+
+盲评（真实 LLM，Dn 标签与组别解耦）均值：
+
+| 组 | 新颖性 (1-5) | 可行性 (1-5) |
+|---|---|---|
+| A 基线（L1 仅） | **2.83** | **4.33** |
+| B 联想（L1+L1.5） | 2.50 | 3.83 |
+
+PASS 标准（B 新颖性 > A 且 B 可行性 ≥ A）未满足。三个任务（同步/限流/重试）全部一致：B 组新颖性不高于 A。
+
+**归因分析（judge 评语 + 机制回顾）**：
+
+1. **结构同构 ≠ 跨域碰撞（核心教训）**。联想池资产与任务**同领域同机制**（限流任务→限流资产、同步任务→事件溯源资产）：它们本来就是"教科书架构模式"（judge 评语："All four converge on the same textbook solution"）。注入后模型被**锚定在教科书模式上**，强化既有路径——这正是检索悖论的另一面：结构同构检索同样可能固化思维，因为资产与任务太"同构"。
+2. **真正的双联想需要领域无关素材**。Koestler bisociation 的碰撞来自"表面领域不同、底层机制可迁移"——如限流任务撞上水库调度/队列背压、同步任务撞上数据库复制。当前联想池（v0.7 benchmark 架构资产）不具备这种素材，注入的是"同域教科书"，不产生碰撞。
+3. **信号存在但噪声淹没**。B 组单份输出确有亮点（judge 评 t2-D3"adaptive controller from backend p95 feedback"、t3-D3"failure taxonomy + DB-driven retry"为最独特），但另一份 B 输出垫底，2 runs 样本下无统计显著提升。
+
+**下一步（重新设计，非关闭）**：
+- [ ] 联想池改为收集**跨域类比素材**（非本领域架构模式）：nature-inspired / 物理 / 社会系统 / 其他行业方案，机制词典匹配后注入"看起来无关但机制可迁移"的资产
+- [ ] 增加领域距离度量：注入前过滤与任务同领域的候选（同域即跳过——结构同构但领域相同的资产交给 L1 即可）
+- [ ] 实验升级：样本 2→5 runs，judge 增加一致性校验（同一设计评两次）
+- [ ] 全部通过后才考虑默认开启
+
+## 7. 相关来源
 
 - [Serendipity by Design (arXiv 2603.19087)](https://ar5iv.labs.arxiv.org/html/2603.19087)
 - [The retrieval paradox in agent memory (moltbook)](https://moltbook.com/post/8894d2e0-6b1e-4eab-9478-039097398794)

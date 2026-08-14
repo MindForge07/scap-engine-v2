@@ -40,6 +40,12 @@ export interface Config {
   residentMaxAgeDays?: number
   /** 是否启用 L1 任务相关预检索（默认 true；false = 只注入项目卡片+常驻）。 */
   useTaskRecall?: boolean
+  /** 是否启用 L1.5 联想通道（默认 false；实验验证后开启，见 bisociation-design.md）。 */
+  assocLane?: boolean
+  /** L1.5 结构匹配注入的联想线索条数上限（默认 1）。 */
+  assocTopN?: number
+  /** 机制词典覆盖/扩展（默认内置 ~12 机制）。 */
+  assocMechanisms?: Mechanism[]
 }
 
 /** 一次 assemble 携带的最小上下文形状。 */
@@ -253,6 +259,139 @@ function textOfEvent(event: SessionEventLike): string | undefined {
   return block?.type === 'text' && block.text ? block.text : undefined
 }
 
+// ── L1.5 联想通道（bisociation）：机制词典 + 结构同构召回 ──
+//
+// 理论基础（见 dsh/bisociation-design.md）：纯相关性召回（L1）会落入检索悖论
+// ——最相似的记忆强化既有路径、抑制跨域灵感。L1.5 用「机制」而非「语义」做
+// 结构匹配：任务命中机制词 → 召回 lesson 内嵌同机制元模式的联想池资产。
+// 联想池 = 迁移的 v0.7 认知资产（importance=2 + lesson 含「元模式」）。
+
+export interface Mechanism {
+  id: string
+  name: string
+  /** 任务文本中的触发词（小写匹配）。 */
+  terms: string[]
+  /** 联想池 lesson/元模式中的结构词（小写匹配）。 */
+  patterns: string[]
+}
+
+/** 内置机制词典：高频架构机制（零 LLM，纯规则）。 */
+export const DEFAULT_MECHANISMS: Mechanism[] = [
+  {
+    id: 'rate-limit', name: '限流/速率限制',
+    terms: ['限流', '速率限制', '令牌桶', 'rate limit', 'token bucket', 'throttl'],
+    patterns: ['限流', '令牌桶', '资源分配约束', '速率'],
+  },
+  {
+    id: 'circuit-breaker', name: '熔断/降级',
+    terms: ['熔断', '断路器', '降级', 'circuit break', 'degrad', 'fallback'],
+    patterns: ['熔断', '降级', '异常处理', '故障隔离', '容错'],
+  },
+  {
+    id: 'event-sourcing', name: '事件溯源/事件流',
+    terms: ['事件溯源', '事件流', '事件驱动', '同步方案', '可回放', 'event sourcing', 'event stream', 'cqrs', 'eda', 'sync'],
+    patterns: ['事件溯源', '事件流', '状态重建', '事件日志', '版本控制', 'event'],
+  },
+  {
+    id: 'state-machine', name: '状态机',
+    terms: ['状态机', '状态转换', 'state machine', 'fsm'],
+    patterns: ['状态机', '状态转换', '状态重建'],
+  },
+  {
+    id: 'feedback-loop', name: '反馈环/触发器',
+    terms: ['反馈环', '反馈回路', '触发器', '闭环', 'feedback loop', 'trigger'],
+    patterns: ['反馈环', '触发器', '闭环', '反馈'],
+  },
+  {
+    id: 'cache-snapshot', name: '缓存/快照',
+    terms: ['缓存', '快照', 'cache', 'snapshot'],
+    patterns: ['缓存', '快照'],
+  },
+  {
+    id: 'concurrency', name: '并发控制/乐观锁',
+    terms: ['并发', '乐观锁', '冲突检测', '版本号', 'concurren', 'optimistic', 'version conflict'],
+    patterns: ['并发', '乐观锁', '版本号', '冲突'],
+  },
+  {
+    id: 'idempotency', name: '幂等/重试',
+    terms: ['幂等', '重试', '补偿', 'idempot', 'retry'],
+    patterns: ['幂等', '重试', '补偿'],
+  },
+  {
+    id: 'scaling', name: '分区/扩展',
+    terms: ['分区', '分片', '水平扩展', 'partition', 'shard', 'scale out'],
+    patterns: ['分区', '分片', '扩展'],
+  },
+  {
+    id: 'redundancy', name: '冗余/高可用',
+    terms: ['冗余', '高可用', '单点', '故障转移', 'redundanc', 'failover', 'ha '],
+    patterns: ['冗余', '单点故障', '高可用'],
+  },
+  {
+    id: 'async', name: '异步/队列',
+    terms: ['异步', '队列', '消息队列', 'async', 'queue'],
+    patterns: ['异步', '队列', '消息'],
+  },
+  {
+    id: 'versioning', name: '版本管理/迁移',
+    terms: ['版本管理', 'schema', '迁移模式', '兼容性', 'versioning', 'migration'],
+    patterns: ['版本', '迁移', 'schema', '兼容'],
+  },
+]
+
+/** 任务文本命中哪些机制（小写子串匹配，零 LLM）。 */
+export function matchMechanisms(task: string, dict: Mechanism[] = DEFAULT_MECHANISMS): Mechanism[] {
+  const lower = task.toLowerCase()
+  const hit = new Map<string, Mechanism>()
+  for (const m of dict) {
+    for (const t of m.terms) {
+      if (lower.includes(t)) {
+        hit.set(m.id, m)
+        break
+      }
+    }
+  }
+  return [...hit.values()]
+}
+
+/** 联想池资产：迁移的认知资产（lesson 内嵌「元模式」标记）。 */
+export function isPoolAsset(e: MemoryExperience): boolean {
+  return /元模式/.test(e.lesson ?? '')
+}
+
+/** 机制结构词是否与资产 lesson 的元模式同构。 */
+function patternHits(mech: Mechanism, lesson: string): number {
+  const lower = lesson.toLowerCase()
+  let n = 0
+  for (const p of mech.patterns) {
+    if (lower.includes(p)) n += 1
+  }
+  return n
+}
+
+/** L1.5 联想召回：任务机制 × 联想池资产的结构匹配（top-N，零 LLM）。 */
+export function findAssociativeCues(
+  task: string,
+  experiences: MemoryExperience[],
+  dict: Mechanism[] = DEFAULT_MECHANISMS,
+  topN = 1,
+): MemoryExperience[] {
+  if (!task) return []
+  const mechs = matchMechanisms(task, dict)
+  if (mechs.length === 0) return []
+  const scored: { e: MemoryExperience; hits: number; mech: Mechanism }[] = []
+  for (const e of experiences) {
+    if (!isPoolAsset(e)) continue
+    for (const m of mechs) {
+      const hits = patternHits(m, e.lesson)
+      if (hits > 0) scored.push({ e, hits, mech: m })
+    }
+  }
+  if (scored.length === 0) return []
+  scored.sort((a, b) => b.hits - a.hits)
+  return scored.slice(0, Math.max(topN, 1)).map(s => s.e)
+}
+
 /** 最近一条真实用户消息，作为 L1 任务文本。
  *
  * MessageSource is merge-extensible (plugins add kinds like
@@ -281,6 +420,10 @@ interface SnapshotOptions {
   recallTopN: number
   residentImportance: number
   residentMaxAgeDays: number
+  /** L1.5 联想通道（默认关闭）。 */
+  assocLane?: boolean
+  assocTopN?: number
+  assocMechanisms?: Mechanism[]
 }
 
 function dateOf(iso: string | undefined): string {
@@ -367,6 +510,20 @@ export function buildSnapshot(mem: MemoryJson, task: string | undefined, opts: S
         parts.push(`- ${e.situation || e.lesson}: ${e.lesson}`)
       }
     }
+
+    // L1.5 联想通道：结构同构召回联想池资产（默认关闭，assocLane: true 启用）。
+    if (opts.assocLane && task) {
+      const cues = findAssociativeCues(task, experiences, opts.assocMechanisms, opts.assocTopN ?? 1)
+      if (cues.length > 0) {
+        parts.push('## 联想线索（跨域）')
+        for (const cue of cues) {
+          const meta = /（元模式：(.+?)）/.exec(cue.lesson)
+          const tag = meta ? `（元模式：${meta[1]}）` : ''
+          const lesson = cue.lesson.length > 160 ? `${cue.lesson.slice(0, 160)}…` : cue.lesson
+          parts.push(`- [联想] ${cue.situation || cue.id}: ${lesson}${tag}`)
+        }
+      }
+    }
   }
 
   if (parts.length === 0) return ''
@@ -389,6 +546,9 @@ export function apply(ctx: PluginContext, config: Config): void {
   const residentImportance = Math.min(Math.max(config.residentImportance ?? 4, 1), 5)
   const residentMaxAgeDays = Math.max(config.residentMaxAgeDays ?? 7, 0)
   const useTaskRecall = config.useTaskRecall !== false
+  const assocLane = config.assocLane === true
+  const assocTopN = Math.min(Math.max(config.assocTopN ?? 1, 1), 5)
+  const assocMechanisms = config.assocMechanisms
   ctx.systemPrompt.context({
     name: 'scap:project-memory',
     order: 50,
@@ -407,6 +567,7 @@ export function apply(ctx: PluginContext, config: Config): void {
           const task = useTaskRecall ? lastUserTask(agent) : undefined
           return buildSnapshot(mem, task, {
             heading, maxChars, recallTopN, residentImportance, residentMaxAgeDays,
+            assocLane, assocTopN, assocMechanisms,
           })
         } catch {
           // malformed projection — fall through to the markdown fallback
