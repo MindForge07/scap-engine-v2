@@ -79,6 +79,21 @@ Mem0 读取路径规则化是同一选择。
 | `residentMaxAgeDays` | 7 | 更新距今 ≤ 该天数的决策作为常驻决策强制注入 |
 | `useTaskRecall` | true | 启用 L1 任务相关预检索；false = 只注入卡片 + 常驻决策 |
 
+## 历史积累迁移（v1 时代 → 当前格式）
+
+旧版（v1 时代）的经验积累是手写 markdown：`.learnings/{LEARNINGS,ERRORS,FEATURE_REQUESTS}.md`（LRN/ERR/FR 块）。
+`migrate/learnings-to-scap.py` 把它们转换为当前 Experience/Decision 记录并 re-export，使分层注入自动生效：
+
+- LRN/ERR → **Experience**（situation=Summary+Details，action=Suggested action/fix，lesson=逐条蒸馏，importance 按 Priority high=5/medium=4）
+- FR → **Decision**（已验证的选择，如 .mcp.json 配置方式）
+- 幂等：按 (project, title/situation) 查重，重跑全 skip（四操作 NOOP 语义）
+- 旧 `data/scap.db`（v2.0 时代）**不迁移**：其中只有 README 演示数据（acme-pay），按记忆正确性原则不入生产
+
+```bash
+python dsh/migrate/learnings-to-scap.py            # 生产 DB + 项目 XDXLC
+python dsh/migrate/learnings-to-scap.py --dry-run  # 只解析不写入
+```
+
 ## 验证
 
 `tests/` 之外，仓库根有完整验证方法（见 `scap-closed-loop-analysis.md` 断点 A）：
