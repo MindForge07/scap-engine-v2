@@ -20,10 +20,12 @@
 # NOT written into any production SCAP memory (memory-correctness gate).
 #
 # Usage:
-#   .\dsh\verify\analogy-exp.ps1 -Harness C:\path\to\deepseek-harness
+#   .\dsh\verify\analogy-exp.ps1 -Harness C:\path\to\deepseek-harness [-Runs 5]
 param(
   [Parameter(Mandatory = $true)][string]$Harness,
-  [string]$MemRoot = ""
+  [string]$MemRoot = "",
+  [int]$Runs = 5,
+  [switch]$JudgeOnly
 )
 $ErrorActionPreference = 'Continue'
 $utf8 = [System.Text.UTF8Encoding]::new($false)
@@ -63,13 +65,19 @@ $focus = "Before designing, study this past experience. It is fundamentally the 
 
 try {
   # Isolated DSH_HOME (no SCAP plugin - controlled prompt injection only)
-  if (Test-Path $MemRoot) { Remove-Item -Recurse -Force $MemRoot }
-  New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-  New-Item -ItemType Directory -Path "$dshHome\profiles\headless" -Force | Out-Null
-  Copy-Item (Join-Path $env:USERPROFILE ".dsh\settings.yaml") "$dshHome\settings.yaml"
-  Copy-Item (Join-Path $env:USERPROFILE ".dsh\.credentials.yaml") "$dshHome\.credentials.yaml"
-  New-Item -ItemType Junction -Path "$dshHome\profiles\node_modules" -Target $realProfiles | Out-Null
-  Write-NoBom "$dshHome\profiles\headless\package.json" @'
+  if (-not $JudgeOnly) {
+    if (Test-Path $MemRoot) { Remove-Item -Recurse -Force $MemRoot }
+    New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+  } elseif (-not (Test-Path $outDir)) {
+    Write-Output "ERROR: -JudgeOnly but no outputs in $outDir"
+    exit 1
+  }
+  if (-not (Test-Path "$dshHome\profiles\headless")) {
+    New-Item -ItemType Directory -Path "$dshHome\profiles\headless" -Force | Out-Null
+    Copy-Item (Join-Path $env:USERPROFILE ".dsh\settings.yaml") "$dshHome\settings.yaml"
+    Copy-Item (Join-Path $env:USERPROFILE ".dsh\.credentials.yaml") "$dshHome\.credentials.yaml"
+    New-Item -ItemType Junction -Path "$dshHome\profiles\node_modules" -Target $realProfiles | Out-Null
+    Write-NoBom "$dshHome\profiles\headless\package.json" @'
 {
   "name": "dsh-profile-headless-test",
   "private": true,
@@ -77,37 +85,51 @@ try {
   "dsh": { "profile": { "bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"] } }
 }
 '@
-  Write-NoBom "$dshHome\profiles\headless\cordis.yml" "[]"
+    Write-NoBom "$dshHome\profiles\headless\cordis.yml" "[]"
+  }
 
-  # 18 runs: task x group(A/B/C) x 2
-  $runs = @()
-  for ($t = 0; $t -lt 3; $t++) {
-    foreach ($g in @('A', 'B', 'C')) {
-      foreach ($r in @(1, 2)) {
-        $id = "t$($t+1)-$g$r"
-        if ($g -eq 'A') {
-          $prompt = $task[$t]
-        } elseif ($g -eq 'B') {
-          $prompt = "$($task[$t])`n`n$focus`n`n[Past experience]$($case[$t])"
-        } else {
-          $prompt = "$($task[$t])`n`n[Past experience from another project]$($case[$t])"
+  # Runs: task x group(A/B/C) x $Runs
+  $runList = @()
+  if (-not $JudgeOnly) {
+    for ($t = 0; $t -lt 3; $t++) {
+      foreach ($g in @('A', 'B', 'C')) {
+        for ($r = 1; $r -le $Runs; $r++) {
+          $id = "t$($t+1)-$g$r"
+          if ($g -eq 'A') {
+            $prompt = $task[$t]
+          } elseif ($g -eq 'B') {
+            $prompt = "$($task[$t])`n`n$focus`n`n[Past experience]$($case[$t])"
+          } else {
+            $prompt = "$($task[$t])`n`n[Past experience from another project]$($case[$t])"
+          }
+          $runList += , @($id, $prompt)
         }
-        $runs += , @($id, $prompt)
       }
     }
-  }
-  foreach ($run in $runs) {
-    $id = $run[0]; $prompt = $run[1]
-    Write-Output "--- run $id ($($prompt.Length) chars)"
-    Run-Headless $id $prompt | Out-Null
+    foreach ($run in $runList) {
+      $id = $run[0]; $prompt = $run[1]
+      Write-Output "--- run $id ($($prompt.Length) chars)"
+      Run-Headless $id $prompt | Out-Null
+    }
   }
 
-  # Blind judge per task (6 designs: A1,A2,B1,B2,C1,C2 -> D1..D6)
+  # Blind judge per task, BATCHED (each batch <= 5 designs to stay under the
   $mapLines = @()
   for ($t = 0; $t -lt 3; $t++) {
-    $judgePrompt = @"
-You are a design review judge. Below are 6 architecture designs for the SAME
-task. For each design score:
+    # all designs for this task, in a group-interleaved order
+    $designs = @()
+    for ($r = 1; $r -le $Runs; $r++) {
+      foreach ($g in @('A', 'B', 'C')) {
+        $id = "t$($t+1)-$g$r"
+        $designs += , @($id)
+      }
+    }
+    $batch = 0
+    for ($s = 0; $s -lt $designs.Count; $s += 5) {
+      $batch++
+      $judgePrompt = @"
+You are a design review judge. Below are up to 5 architecture designs for the
+SAME task. For each design score:
 - quality (1-5): concreteness, coherence, implementability
 - depth (1-5): how deeply the reasoning covers the problem's hard parts
 Also flag (yes/no) whether the design reuses these strategy elements:
@@ -117,25 +139,25 @@ E3 <unique id at first acceptance, check-before-write, duplicate returns origina
 Respond with a compact table: Dn | quality | depth | E1 | E2 | E3 | one-line rationale.
 Task: $($task[$t])
 "@
-    $labels = @()
-    $i = 1
-    foreach ($g in @('A', 'B', 'C')) {
-      foreach ($r in @(1, 2)) {
-        $id = "t$($t+1)-$g$r"
+      $labels = @()
+      $i = 1
+      $chunk = $designs[$s..([Math]::Min($s + 4, $designs.Count - 1))]
+      foreach ($entry in $chunk) {
+        $id = $entry[0]
         $body = Get-Content (Join-Path $outDir "$id.txt") -Raw
         if ($body.Length -gt 2600) { $body = $body.Substring(0, 2600) }
         $judgePrompt += "`n`nD$i (design $id):`n$body"
         $labels += "D$i=$id"
         $i++
       }
+      $mapLines += "task$($t+1) batch${batch}: $($labels -join ', ')"
+      $env:DSH_HOME = $dshHome
+      Push-Location $Harness
+      $judge = node --import tsx/esm apps/cli/src/bin.ts --profile headless $judgePrompt 2>&1
+      Pop-Location
+      $judge | Set-Content (Join-Path $outDir "judge-t$($t+1)-b$batch.txt") -Encoding utf8
+      Write-Output "--- judge task$($t+1) batch$batch saved"
     }
-    $mapLines += "task$($t+1): $($labels -join ', ')"
-    $env:DSH_HOME = $dshHome
-    Push-Location $Harness
-    $judge = node --import tsx/esm apps/cli/src/bin.ts --profile headless $judgePrompt 2>&1
-    Pop-Location
-    $judge | Set-Content (Join-Path $outDir "judge-t$($t+1).txt") -Encoding utf8
-    Write-Output "--- judge task$($t+1) saved"
   }
   $mapLines | Set-Content (Join-Path $outDir "judge-map.txt") -Encoding utf8
   Write-Output "ANALOGY EXP DONE - results in $outDir"
