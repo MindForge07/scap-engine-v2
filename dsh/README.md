@@ -86,13 +86,17 @@ Mem0 读取路径规则化是同一选择。
 
 - LRN/ERR → **Experience**（situation=Summary+Details，action=Suggested action/fix，lesson=逐条蒸馏，importance 按 Priority high=5/medium=4）
 - FR → **Decision**（已验证的选择，如 .mcp.json 配置方式）
+- `--assets-dir`：迁移 v0.7 认知资产（`.scap/assets`，CA-*）为**联想池**经验（importance=2 + asset 标签 + lesson 内嵌元模式），供 L1.5 联想通道结构匹配召回（见 `bisociation-design.md`）；CA-0179（已验证的 Agent-in-the-loop 模式）importance=4
 - 幂等：按 (project, title/situation) 查重，重跑全 skip（四操作 NOOP 语义）
 - 旧 `data/scap.db`（v2.0 时代）**不迁移**：其中只有 README 演示数据（acme-pay），按记忆正确性原则不入生产
 
 ```bash
-python dsh/migrate/learnings-to-scap.py            # 生产 DB + 项目 XDXLC
-python dsh/migrate/learnings-to-scap.py --dry-run  # 只解析不写入
+python dsh/migrate/learnings-to-scap.py                       # 生产 DB + 项目 XDXLC
+python dsh/migrate/learnings-to-scap.py --assets-dir C:\Users\XDXLC\.scap\assets
+python dsh/migrate/learnings-to-scap.py --dry-run             # 只解析不写入
 ```
+
+> 联想通道（L1.5，从检索悖论到双联想创新）设计见 [`bisociation-design.md`](bisociation-design.md)。
 
 ## 验证
 

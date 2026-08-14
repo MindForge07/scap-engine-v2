@@ -8,6 +8,13 @@ Experience / Decision records so the layered injection picks them up:
                     Priority: high=5 medium=4)
   FR-*           -> Decision (the validated choice, e.g. .mcp.json placement)
 
+Optional --assets-dir migrates v0.7-era cognitive assets (.scap/assets/*.md,
+CA-* front-matter format) as serendipity-pool experiences: low importance,
+tagged with asset_type + extracted meta-pattern, so L1 relevance ranking
+leaves them dormant while the L1.5 associative lane (see
+dsh/bisociation-design.md) can recall them on structural match.
+CA-0179 (validated Agent-in-the-loop pattern) gets importance 4 instead.
+
 Idempotent: skips records whose (project, title) / (project, situation)
 already exist — same NOOP semantics as the four-op write strategy.
 
@@ -19,6 +26,7 @@ memory-correctness gate.
 Usage:
   python dsh/migrate/learnings-to-scap.py [--db PATH] [--project NAME]
                                           [--learnings-dir DIR]
+                                          [--assets-dir DIR]
 
 Defaults: production DB (.dsh/scap-exports/data/scap.db), project XDXLC.
 Re-exports {project}.md + .json after writing so injection reflects it.
@@ -77,6 +85,15 @@ FR_DECISIONS = {
 
 ENTRY_RE = re.compile(r"^##\s+(\S+):\s*(.+)$")
 FIELD_RE = re.compile(r"^-\s+\*\*([^*]+)\*\*\s*:\s*(.*)$")
+FM_KEY_RE = re.compile(r'^(\w+):\s*"?(.*?)"?\s*$')
+SECTION_RE = re.compile(r"^##\s+(.+)$")
+
+# CA-0179 is the Agent-in-the-loop pattern validated by this session's
+# production integration — it earns real importance in XDXLC.
+CA_HIGH_IMPORTANCE = {"CA-0179": 4}
+CA_DEFAULT_IMPORTANCE = 2  # serendipity pool: dormant for L1, reachable by L1.5
+
+META_PATTERN_RE = re.compile(r"元模式[为是]\s*['\"“]?([^'\"”]+?)['\"”]?[。；;]")
 
 
 def parse_learnings(dir_path: Path) -> list[tuple[str, str, dict]]:
@@ -100,6 +117,45 @@ def parse_learnings(dir_path: Path) -> list[tuple[str, str, dict]]:
     return entries
 
 
+def parse_assets(dir_path: Path) -> list[dict]:
+    """Parse v0.7 cognitive assets (.scap/assets/**/*.md, CA-* front-matter).
+
+    Returns dicts with front-matter fields plus extracted sections:
+    l3 (structure abstraction), l4 (core pattern), l5 (unpacking), meta_pattern.
+    """
+    assets = []
+    for md in sorted(dir_path.rglob("*.md")):
+        text = md.read_text(encoding="utf-8")
+        fm = {}
+        body = text
+        m = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.S)
+        if m:
+            for line in m.group(1).splitlines():
+                k = FM_KEY_RE.match(line.strip())
+                if k:
+                    fm[k.group(1)] = k.group(2).strip().strip('"')
+            body = text[m.end():]
+        sections = {}
+        current = None
+        for line in body.splitlines():
+            s = SECTION_RE.match(line.strip())
+            if s:
+                current = s.group(1).strip()
+                sections[current] = []
+            elif current:
+                sections[current].append(line.strip())
+        meta = META_PATTERN_RE.search(" ".join(sections.get("L4 核心模式", [])))
+        assets.append({
+            "file": str(md),
+            "front": fm,
+            "l3": " ".join(x for x in sections.get("L3 结构抽象", []) if x and not x.startswith("*")),
+            "l4": " ".join(x for x in sections.get("L4 核心模式", []) if x and not x.startswith("*")),
+            "l5": " ".join(x for x in sections.get("L5 解压指令", []) if x and not x.startswith("*")),
+            "meta_pattern": meta.group(1) if meta else "",
+        })
+    return assets
+
+
 def priority_importance(priority: str, fallback: int) -> int:
     return {"high": 5, "medium": 4, "low": 3}.get(priority.strip().lower(), fallback)
 
@@ -109,6 +165,7 @@ def main() -> int:
     ap.add_argument("--db", default=DEFAULT_DB, help="target SQLite DB")
     ap.add_argument("--project", default=DEFAULT_PROJECT, help="target project namespace")
     ap.add_argument("--learnings-dir", default=str(DEFAULT_LEARNINGS))
+    ap.add_argument("--assets-dir", default="", help="v0.7 cognitive assets dir (.scap/assets)")
     ap.add_argument("--dry-run", action="store_true", help="parse and report only")
     args = ap.parse_args()
 
@@ -170,6 +227,38 @@ def main() -> int:
             print(f"  dec   {entry_id} [{imp}] {t}")
         else:
             print(f"  ?     {entry_id}: unknown prefix, skipped")
+
+    # ── v0.7 cognitive assets → serendipity-pool experiences ──
+    if args.assets_dir:
+        assets = parse_assets(Path(args.assets_dir))
+        print(f"parsed {len(assets)} assets from {args.assets_dir}")
+        for a in assets:
+            fm = a["front"]
+            aid = fm.get("asset_id", Path(a["file"]).stem)
+            imp = CA_HIGH_IMPORTANCE.get(aid, CA_DEFAULT_IMPORTANCE)
+            situation = (f"[v0.7 认知资产 {aid} {fm.get('asset_type', '')}] "
+                         f"{fm.get('title', '')}: {a['l3']}")
+            lesson = a["l4"] or a["l3"]
+            if a["meta_pattern"]:
+                lesson += f"（元模式：{a['meta_pattern']}）"
+            action = a["l5"] or ""
+            tags = [t for t in (fm.get("asset_type"), aid, fm.get("source_agent"), "asset", "legacy") if t]
+            created = datetime.fromisoformat(fm["created_at"]) if fm.get("created_at") \
+                else datetime(2026, 6, 26, tzinfo=timezone.utc)
+            dup = store.conn.execute(
+                "SELECT 1 FROM experiences WHERE project = ? AND situation = ? LIMIT 1",
+                (args.project, situation)).fetchone()
+            if dup:
+                print(f"  skip  {aid} (existing)")
+                skipped += 1
+                continue
+            e = Experience(project=args.project, situation=situation, action=action,
+                           lesson=lesson, importance=imp, tags=tags, created_at=created)
+            if not args.dry_run:
+                store.save_experience(e)
+            new_exp += 1
+            print(f"  asset {aid} [{imp}] {fm.get('title', '')}"
+                  + (f" 元模式={a['meta_pattern']}" if a["meta_pattern"] else ""))
 
     if args.dry_run:
         print(f"dry-run: {new_exp} experiences, {new_dec} decisions, {skipped} skipped")
