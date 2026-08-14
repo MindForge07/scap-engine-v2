@@ -33,4 +33,5 @@ def store(tmp_path):
     db_path = str(tmp_path / "test.db")
     s = MemoryStore(db_path)
     s.initialize()
-    return s
+    yield s
+    s.close()

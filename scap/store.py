@@ -855,6 +855,7 @@ class MemoryStore:
         """
         json_path = os.path.splitext(output_path)[0] + ".json"
         payload = {
+            "format_version": 1,
             "project": project,
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "context": {

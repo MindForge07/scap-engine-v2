@@ -74,3 +74,50 @@ class TestConfigure:
         ])
         assert result.exit_code == 0
         assert "updated" in result.output.lower()
+
+
+class TestAudit:
+    def test_audit_empty_project(self, runner):
+        r, base_args = runner
+        result = r.invoke(cli, base_args + ["audit", "--project", "acme"])
+        assert result.exit_code == 0
+        assert "均未超过" in result.output
+
+    def test_audit_lists_stale_decision(self, runner):
+        from datetime import datetime, timedelta, timezone
+        from scap.models import Decision
+        from scap.store import MemoryStore
+        r, base_args = runner
+        r.invoke(cli, base_args + ["init", "--project", "acme"])
+        db = base_args[1]
+        store = MemoryStore(db)
+        store.initialize()
+        now = datetime.now(timezone.utc)
+        store.save_decision(Decision(
+            project="acme", title="旧决策", decision="A", rationale="r",
+            created_at=now - timedelta(days=200), updated_at=now - timedelta(days=200),
+        ))
+        result = r.invoke(cli, base_args + ["audit", "--project", "acme", "--older-than", "90"])
+        assert result.exit_code == 0
+        assert "旧决策" in result.output
+
+
+class TestFeedback:
+    def test_feedback_without_trace_reports_clearly(self, runner):
+        r, base_args = runner
+        r.invoke(cli, base_args + ["init", "--project", "acme"])
+        result = r.invoke(cli, base_args + ["feedback", "DC-20260101-0001", "--helpful"])
+        assert result.exit_code == 0
+        assert "没有 latent trace" in result.output
+
+    def test_feedback_wrong_project_rejected(self, runner):
+        from scap.models import Decision
+        from scap.store import MemoryStore
+        r, base_args = runner
+        db = base_args[1]
+        store = MemoryStore(db)
+        store.initialize()
+        d = store.save_decision(Decision(project="acme", title="t", decision="d"))
+        result = r.invoke(cli, base_args + ["feedback", d.id, "--helpful", "--project", "other"])
+        assert result.exit_code == 0
+        assert "不属于项目" in result.output
