@@ -13,10 +13,14 @@
 
 | 变更类型 | 必须通过 |
 |---|---|
-| 任何代码 | `pytest tests/`（自带覆盖率 ≥85% 门禁 + golden 快照） |
+| 任何代码 | `dsh/verify/run-checks.ps1`（单元 + golden + 规模 + **覆盖率 ≥85% 门禁**） |
 | 注入插件 / 导出格式 | 上述 + `dsh/verify/smoke.ps1`（真实组合冒烟） |
-| 写入/检索/质量逻辑 | 上述 + 按 `dsh/verify/value-check.md` 跑价值实验 |
+| 检索/写入/质量逻辑 | 上述 + `dsh/verify/replay.py`（生产流量回放） |
+| 记忆机制大改 | 上述 + 按 `dsh/verify/value-check.md` 跑价值实验 |
 | 覆盖率 | **只升不降**：`fail_under` 只在提高后上调 |
+
+> 单文件调试直接 `pytest tests/test_x.py`；覆盖率门禁只在 run-checks/CI 触发。
+> CI（.github/workflows/ci.yml）与 run-checks 跑同一命令——本地过了，CI 才过。
 
 ## 环境坑清单（Windows，踩过并修复的真实坑）
 

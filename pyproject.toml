@@ -45,13 +45,17 @@ include = ["scap*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --tb=short --cov=scap --cov-report=term-missing"
+# NOTE: coverage is NOT in addopts — the gate runs through
+# dsh/verify/run-checks.ps1 and CI (pytest --cov=scap ...), so single-file
+# debugging does not trip the aggregate gate. fail_under below applies
+# whenever --cov is enabled.
+addopts = "-v --tb=short"
 
 [tool.coverage.run]
 source = ["scap"]
 
 [tool.coverage.report]
-# Coverage gate: every `pytest` run enforces it (addopts above). Raise the
-# bar as coverage grows — do not lower it.
+# Coverage gate (enforced by run-checks.ps1 and CI): raise the bar as
+# coverage grows — do not lower it.
 fail_under = 85
 show_missing = true

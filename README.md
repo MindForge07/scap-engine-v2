@@ -243,13 +243,22 @@ PostgreSQL 15, Redis 7, Kafka 3.5
 - **已缓解的负效益敞口**：错误记忆固化（质量门 + importance + feedback 闭环）、过时锚定（recency 衰减 + audit + supersede）
 - **未验证**：真实生产环境的长期效果、记忆错误时的负效益定量（需要更大规模 A/B）
 
-### 测试
+### 测试与验证
 
 ```bash
-pytest tests/ -v    # 209 个测试，~27s
+# 完整验证门禁（单元 + golden + 规模压力 + 覆盖率 ≥85%）
+.\dsh\verify\run-checks.ps1
+
+# 真实组合冒烟（隔离 DSH + 真实 LLM，注入分层行为）
+.\dsh\verify\smoke.ps1 -Harness <dsh-checkout> -ScapRepo . -Python <python>
+
+# 生产流量回放（真实 DSH 会话消息离线回放，零 LLM）
+python dsh\verify\replay.py <session.jsonl.zstd> [--memory-md <real>.scap/<project>.md]
 ```
 
-覆盖：模型校验、存储 CRUD/FTS/迁移、四层检索与中文召回质量、并发/Unicode/大数据量压力、MCP 工具、CLI、质量门/recency/fitness、四操作/audit/reflect、分层注入 JSON 投影。
+覆盖：模型校验、存储 CRUD/FTS/迁移、四层检索与中文召回质量、并发/Unicode/压力、
+**生产级规模（5k 决策 + 2k 经验）性能预算**、MCP 工具、CLI、质量门/recency/
+fitness、四操作/audit/reflect、golden 格式快照、分层注入。
 
 ---
 
